@@ -43,3 +43,14 @@ https://www.interactivebrokers.com/api/doc.html
 Open https://localhost:5000 to login
 App demo is available after you login under: https://localhost:5000/demo#/
 
+(base) manojkandlikar@Manojs-MacBook-Pro tradflashflowclient % curl -s localhost:8080/api/insights/summary
+{"timeframe":"daily","updated_at":"2025-11-02T16:41:03.735Z","breadth":{"advancers":0,"decliners":0,"unchanged":0},"volume":{"total":0,"up":0,"down":0},"trend":{"bias":"neutral","strength":0},"iv_rank":{}}%                                                                                                                                                                                                          (base) manojkandlikar@Manojs-MacBook-Pro tradflashflowclient % curl -s localhost:8080/api/insights/sentiment
+{"put_call_vol_ratio":null,"put_call_oi_ratio":null,"dark_pool_score":null,"news_sentiment":null,"options_uoa":[]}%                                                                                         (base) manojkandlikar@Manojs-MacBook-Pro tradflashflowclient % curl -s localhost:8080/api/insights/summary?tf=daily
+zsh: no matches found: localhost:8080/api/insights/summary?tf=daily
+(base) manojkandlikar@Manojs-MacBook-Pro tradflashflowclient % curl -s localhost:8080/api/insights/patterns
+{"timeframe":"5m","patterns":[]}%                                                                                                                                                                           (base) manojkandlikar@Manojs-MacBook-Pro tradflashflowclient % 
+(base) manojkandlikar@Manojs-MacBook-Pro tradflashflowclient % 
+(base) manojkandlikar@Manojs-MacBook-Pro tradflashflowclient % curl -s localhost:8080/api/insights/sentiment
+{"put_call_vol_ratio":null,"put_call_oi_ratio":null,"dark_pool_score":null,"news_sentiment":null,"options_uoa":[]}%                                                                                         (base) manojkandlikar@Manojs-MacBook-Pro tradflashflowclient % 
+(base) manojkandlikar@Manojs-MacBook-Pro tradflashflowclient % 
+(base) manojkandlikar@Manojs-MacBook-Pro tradflashflowclient % curl -s localhost:8080/api/insights/sentiment
