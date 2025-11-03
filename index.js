@@ -15,16 +15,7 @@
  *   IB_SSL=1                  # 1=https, 0=http
  *   IB_COOKIE="ibkr cookies"  # Paste cookie header value from the CP Gateway session (e.g. "ib=...; oneib=...")
  *   IB_ALLOW_INSECURE=1       # optional; allow self-signed TLS from CP Gateway
- *
- * NOTES
- * - Market data requires appropriate IBKR subscriptions on your account.
- * - This code subscribes to Level I fields: last(31), bid(84), ask(86), bidSize(88), askSize(85), lastSize(7059).
- * - Options chain expansion uses /trsrv/stocks, /iserver/marketdata/snapshot, /iserver/secdef/strikes,
- *   then resolves option conids via /iserver/secdef/info with (sectype=OPT, month, right, strike).
  */
-
-//import fs from 'fs';
-//import { setGlobalDispatcher, Agent } from 'undici';
 
 import "./instrument-http.js";
 import { httpMetrics } from "./instrument-http.js";
@@ -70,7 +61,6 @@ const BLOCK_MIN_QTY          = 250;
 const BLOCK_MIN_NOTIONAL     = 100000;
 
 // fallback polling (IBKR has snapshots; we use low-rate snapshot fallback)
-const FALLBACK_IDLE_MS       = 3500;
 const FALLBACK_POLL_EVERY_MS = 2500;
 
 /* ================= APP / WS ================= */
@@ -133,9 +123,9 @@ const optNBBO  = new Map(); // occ     -> { bid, ask, ts }
 const optState = new Map();
 const dayKey = () => new Date().toISOString().slice(0,10);
 
-// watches (we keep same shape names as original so UI needn't change)
-const alpacaSubs = new Set();               // equities (symbol strings) — name retained for UI compatibility
-const tradierOptWatch = { set: new Set() }; // option JSON strings     — name retained for UI compatibility
+// watches (keep original names for client compatibility)
+const alpacaSubs = new Set();               // equities (symbol strings)
+const tradierOptWatch = { set: new Set() }; // option JSON strings
 
 // fallback + sweeps
 const optLastPrintTs = new Map(); // occ -> last ts seen
@@ -167,91 +157,41 @@ function within30Days(dISO) {
   return (t - now) <= MAX_EXPIRY_DAYS * 24 * 3600 * 1000 && (t > now - (12*3600*1000)); // allow today+future
 }
 
-/**
- * Update buffers.* with OI confirmation (unchanged from your logic)
- */
-function confirmOccForDate(occ, dateStr) {
-  const d0 = new Date(dateStr);
-  const prev = new Date(d0.getTime() - 24*3600*1000);
-  const prevDate = prev.toISOString().slice(0,10);
-
-  const oiPrev = eodOiByDateOcc.get(`${prevDate}|${occ}`);
-  const oiCurr = eodOiByDateOcc.get(`${dateStr}|${occ}`);
-
-  if (!Number.isFinite(oiPrev) || !Number.isFinite(oiCurr)) return 0;
-  const delta = oiCurr - oiPrev;
-
-  const confirmOne = (m) => {
-    if (m.occ !== occ) return false;
-    const day = ymdFromTs(m.ts || Date.now());
-    if (day !== dateStr) return false;
-
-    let oc_confirm = "INCONCLUSIVE";
-    let reason = `ΔOI=${delta} from ${prevDate}→${dateStr}`;
-    if (delta > 0 && (m.oc_intent === "BTO" || m.oc_intent === "STO")) {
-      oc_confirm = "OPEN_CONFIRMED"; reason += " (OI increased → opens)";
-    } else if (delta < 0 && (m.oc_intent === "BTC" || m.oc_intent === "STC")) {
-      oc_confirm = "CLOSE_CONFIRMED"; reason += " (OI decreased → closes)";
-    }
-    m.oi_after = oiCurr;
-    m.oi_delta = delta;
-    m.oc_confirm = oc_confirm;
-    m.oc_confirm_reason = reason;
-    m.oc_confirm_ts = Date.now();
-    return true;
+/* ================== UNIQUE KEYS (fix duplicate React keys) ================== */
+function contentKeyForId(msg) {
+  return {
+    type: msg.type,
+    provider: msg.provider ?? null,
+    symbol: msg.symbol ?? msg.underlying ?? null,
+    occ: msg.occ ?? null,
+    side: msg.side ?? null,
+    price: Number(msg.price ?? 0),
+    size: Number(msg.qty ?? msg.size ?? 0),
+    option: msg.option ? {
+      expiration: msg.option.expiration,
+      right: msg.option.right,
+      strike: Number(msg.option.strike ?? 0),
+    } : null,
   };
-
-  let touched = 0;
-  for (const arrName of ["options_ts", "sweeps", "blocks"]) {
-    const arr = buffers[arrName];
-    for (const m of arr) if (confirmOne(m)) touched++;
-  }
-  return touched;
 }
-
-function recordEodRows(dateStr, rows) {
-  let n = 0;
-  for (const r of rows) {
-    let occ = r.occ;
-    if (!occ && r.underlying && r.expiration && r.right && Number.isFinite(Number(r.strike))) {
-      occ = toOcc(String(r.underlying).toUpperCase(), String(r.expiration), String(r.right).toUpperCase(), Number(r.strike));
-    }
-    const oi = Number(r.oi);
-    if (!occ || !Number.isFinite(oi)) continue;
-    eodOiByDateOcc.set(`${dateStr}|${occ}`, oi);
-    lastEodDateForOcc.set(occ, dateStr);
-    n++;
-  }
-  return n;
+function stableIdFromContent(msg) {
+  const keyStr = JSON.stringify(contentKeyForId(msg));
+  return createHash("sha1").update(keyStr).digest("hex");
 }
-
-/* ================= HELPERS ================= */
-function getOptState(key) {
-  const today = dayKey();
-  const s = optState.get(key) ?? { oi_before: 0, vol_today_before: 0, last_reset: today };
-  if (s.last_reset !== today) { s.vol_today_before = 0; s.last_reset = today; }
-  optState.set(key, s);
-  return s;
-}
-const setOptOI  = (k, oi) => { const s = getOptState(k); s.oi_before = Number(oi)||0; optState.set(k, s); };
-const setOptVol = (k, v)  => { const s = getOptState(k); s.vol_today_before = Math.max(0, Number(v)||0); optState.set(k, s); };
-const bumpOptVol = (k, qty) => { const s = getOptState(k); s.vol_today_before += Number(qty)||0; optState.set(k, s); };
-
-function stableId(msg) {
-  const key = JSON.stringify({
-    type: msg.type, provider: msg.provider,
-    symbol: msg.symbol ?? msg.underlying,
-    occ: msg.occ, side: msg.side,
-    price: msg.price, size: msg.size,
-    ts: msg.ts ?? msg.time ?? msg.at
-  });
-  return createHash("sha1").update(key).digest("hex");
+const perTypeIdCounts = new Map(); // type -> Map(baseId -> count)
+function uniquePerTypeId(type, baseId) {
+  let byBase = perTypeIdCounts.get(type);
+  if (!byBase) { byBase = new Map(); perTypeIdCounts.set(type, byBase); }
+  const n = (byBase.get(baseId) || 0) + 1;
+  byBase.set(baseId, n);
+  return n === 1 ? `${type}:${baseId}` : `${type}:${baseId}#${n}`;
 }
 function normalizeForFanout(msg) {
-  const now = Date.now();
-  const withTs = { ts: typeof msg.ts === "number" ? msg.ts : now, ...msg };
-  const id = msg.id ?? stableId(withTs) ?? randomUUID();
-  return { id, ...withTs };
+  const withTs = { ts: typeof msg.ts === "number" ? msg.ts : Date.now(), ...msg };
+  const base = stableIdFromContent(withTs);
+  const id = uniquePerTypeId(withTs.type, base);
+  const renderKey = `${id}:${withTs.ts}`; // optional, ultra-unique
+  return { id, renderKey, ...withTs };
 }
 function broadcast(obj) {
   const s = JSON.stringify(obj);
@@ -273,6 +213,18 @@ function pushAndFanout(msg) {
   }
   broadcast(m);
 }
+
+/* ================= HELPERS ================= */
+function getOptState(key) {
+  const today = dayKey();
+  const s = optState.get(key) ?? { oi_before: 0, vol_today_before: 0, last_reset: today };
+  if (s.last_reset !== today) { s.vol_today_before = 0; s.last_reset = today; }
+  optState.set(key, s);
+  return s;
+}
+const setOptOI  = (k, oi) => { const s = getOptState(k); s.oi_before = Number(oi)||0; optState.set(k, s); };
+const setOptVol = (k, v)  => { const s = getOptState(k); s.vol_today_before = Math.max(0, Number(v)||0); optState.set(k, s); };
+const bumpOptVol = (k, qty) => { const s = getOptState(k); s.vol_today_before += Number(qty)||0; optState.set(k, s); };
 
 function toOcc(ul, expISO, right, strike) {
   const yymmdd = expISO.replaceAll("-", "").slice(2);
@@ -348,7 +300,7 @@ function normOptionsPrint(provider, p) {
   bumpOptVol(key, p.size);
 
   return {
-    id: `${now}-${Math.random().toString(36).slice(2,8)}`,
+    id: `${now}-${Math.random().toString(36).slice(2,8)}`, // replaced by normalizeForFanout
     ts: now,
     type: "options_ts",
     provider,
@@ -358,9 +310,9 @@ function normOptionsPrint(provider, p) {
     side: p.side,        // BUY | SELL
     qty: p.size,
     price: p.price,
-    oc_intent: intent.tag,       // BTO/STO/BTC/STC/UNK
-    intent_conf: intent.conf,    // 0..1
-    fill_at: intent.at,          // BID|ASK|MID
+    oc_intent: intent.tag,
+    intent_conf: intent.conf,
+    fill_at: intent.at,
     intent_reasons: intent.reasons,
     oi_before: intent.oi_yday,
     vol_before: intent.vol_before,
@@ -374,7 +326,7 @@ function normEquityPrint(provider, { symbol, price, size }) {
     ? "MID"
     : (price >= q.ask ? "BUY" : (price <= q.bid ? "SELL" : "MID"));
   return {
-    id: `${now}-${Math.random().toString(36).slice(2,8)}`,
+    id: `${now}-${Math.random().toString(36).slice(2,8)}`, // replaced by normalizeForFanout
     ts: now,
     type: "equity_ts",
     provider,
@@ -385,23 +337,123 @@ function normEquityPrint(provider, { symbol, price, size }) {
   };
 }
 
-/*
-const insecure = String(process.env.CP_INSECURE || '').trim() === '1';
-const caFile = process.env.CP_CA_FILE && process.env.CP_CA_FILE.trim();
+/* ================= IBKR SESSION PRIMING (fixes /accounts + bridge) ================= */
+let ibPrimed = false;
+let ibLastPrime = 0;
+let ibAccountIds = [];
 
-if (caFile && fs.existsSync(caFile)) {
-  // Strong option: trust the gateway's CA/cert
-  const ca = fs.readFileSync(caFile, 'utf8');
-  setGlobalDispatcher(new Agent({ connect: { tls: { ca } } }));
-  console.log('[TLS] Using pinned CA from', caFile);
-} else if (insecure) {
-  // Dev-only: accept self-signed / expired (NOT for prod)
-  setGlobalDispatcher(new Agent({ connect: { tls: { rejectUnauthorized: false } } }));
-  console.warn('[TLS] CP_INSECURE=1 -> rejectUnauthorized=false (dev only)');
+async function ibPrimeSession() {
+  if (MOCK) { ibPrimed = true; return true; }
+  const now = Date.now();
+  if (ibPrimed && (now - ibLastPrime) < 30000) return true; // throttle re-prime to 30s
+
+  const st = await ibFetch(`/iserver/auth/status`);
+  if (!st.ok) return false;
+
+  const acc = await ibFetch(`/iserver/accounts`);
+  if (!acc.ok || !acc.data) return false;
+
+  // Some gateways need /iserver/reauthorize or /iserver/marketdata/snapshot after accounts;
+  // doing a harmless echo to warm the "bridge":
+  await ibFetch(`/portfolio/accounts`);
+
+  ibAccountIds = (acc.data?.accounts || acc.data?.[0]?.accounts || acc.data?.accountIds || []).map(String);
+  ibPrimed = true;
+  ibLastPrime = Date.now();
+  console.log(`[IB] primed session. accounts=${ibAccountIds.join(",") || "?"}`);
+  return true;
 }
-*/
+// === Add near other IBKR globals ===
+// let IB_BOOT = { authed: false, accountsReady: false, lastAccountCheck: 0 };
 
-/* ================= IBKR: tiny HTTP helper ================= */
+// ---- helpers ----
+// async function ibEnsureAuth() {
+//   // Lightweight cache ~30s
+//   if (IB_BOOT.authed && Date.now() - IB_BOOT.lastAccountCheck < 30000) return true;
+//   const r = await fetch(`${IB_BASE}/iserver/auth/status`, {
+//     headers: { Accept: "application/json", ...(IB_COOKIE ? { Cookie: IB_COOKIE } : {}) }
+//   });
+//   const data = await r.json().catch(()=>null);
+//   IB_BOOT.authed = !!(data && (data.authenticated || data.connected || data.competing || data.requires_twofa === false));
+//   return IB_BOOT.authed;
+// }
+
+// async function ibEnsureAccounts() {
+//   // Throttle to avoid hammering the gateway
+//   if (IB_BOOT.accountsReady && Date.now() - IB_BOOT.lastAccountCheck < 30000) return true;
+//   await ibEnsureAuth();
+//   const r = await fetch(`${IB_BASE}/iserver/accounts`, {
+//     headers: { Accept: "application/json", ...(IB_COOKIE ? { Cookie: IB_COOKIE } : {}) }
+//   });
+//   const ok = r.ok;
+//   IB_BOOT.accountsReady = ok;
+//   IB_BOOT.lastAccountCheck = Date.now();
+//   if (!ok) {
+//     const t = await r.text();
+//     console.warn(`[IBHTTP ACCOUNTS] ${r.status} ${t}`);
+//   }
+//   return ok;
+// }
+let IB_BOOT = { authed: false, accountsReady: false, lastCheck: 0 };
+
+async function ibWake() {
+  // harmless ping that often clears "no bridge"
+  const r = await fetch(`${IB_BASE}/tickle`, {
+    headers: { Accept: "application/json", ...(IB_COOKIE ? { Cookie: IB_COOKIE } : {}) }
+  }).catch(() => null);
+  return !!r;
+}
+
+async function ibReauth() {
+  const r = await fetch(`${IB_BASE}/iserver/reauthenticate`, {
+    method: "POST",
+    headers: { Accept: "application/json", ...(IB_COOKIE ? { Cookie: IB_COOKIE } : {}) }
+  }).catch(() => null);
+  return !!r && r.ok;
+}
+
+async function ibEnsureAuth() {
+  if (IB_BOOT.authed && Date.now() - IB_BOOT.lastCheck < 30000) return true;
+  const r = await fetch(`${IB_BASE}/iserver/auth/status`, {
+    headers: { Accept: "application/json", ...(IB_COOKIE ? { Cookie: IB_COOKIE } : {}) }
+  }).catch(() => null);
+  const data = r && await r.json().catch(() => null);
+  IB_BOOT.authed = !!(data && (data.authenticated || data.connected));
+  return IB_BOOT.authed;
+}
+
+async function ibEnsureAccounts() {
+  // throttle checks
+  if (IB_BOOT.accountsReady && Date.now() - IB_BOOT.lastCheck < 30000) return true;
+
+  await ibEnsureAuth();
+  await ibWake();                 // nudge the backend
+  await ibReauth();               // start the brokerage bridge
+
+  const callAccounts = async () => fetch(`${IB_BASE}/iserver/accounts`, {
+    headers: { Accept: "application/json", ...(IB_COOKIE ? { Cookie: IB_COOKIE } : {}) }
+  });
+
+  let r = await callAccounts().catch(() => null);
+  if (r && !r.ok) {
+    const t = await r.text();
+    if (/no bridge/i.test(t)) {
+      // try one more time after a brief delay and another reauth
+      await new Promise(res => setTimeout(res, 400));
+      await ibWake();
+      await ibReauth();
+      r = await callAccounts().catch(() => null);
+    }
+  }
+
+  IB_BOOT.accountsReady = !!(r && r.ok);
+  IB_BOOT.lastCheck = Date.now();
+  if (!IB_BOOT.accountsReady) {
+    const t = r ? await r.text() : "no response";
+    console.warn(`[IBHTTP ACCOUNTS] ${r ? r.status : "ERR"} ${t}`);
+  }
+  return IB_BOOT.accountsReady;
+}
 async function ibFetch(path, opts = {}) {
   const url = `${IB_BASE}${path}`;
   const headers = {
@@ -409,25 +461,48 @@ async function ibFetch(path, opts = {}) {
     ...(IB_COOKIE ? { Cookie: IB_COOKIE } : {}),
     ...(opts.headers || {})
   };
-  const r = await fetch(url, { ...opts, headers });
-  const text = await r.text();
-  let json = null;
-  try { json = text ? JSON.parse(text) : null; } catch { json = null; }
-  if (!r.ok) {
-    console.warn(`[IBHTTP ${opts.method||"GET"}] ${url} -> ${r.status}`, json || text);
-  } else {
-    // track debug http metrics (like your instrument-http)
-  }
-  return { ok: r.ok, status: r.status, data: json, raw: text };
-}
 
+  // Ensure bridge is ready before endpoints that need brokerage context
+  const needsBridge =
+    /^\/iserver\/(accounts|marketdata|secdef)\//.test(path) ||
+    /^\/trsrv\//.test(path);
+
+  if (needsBridge) {
+    await ibEnsureAccounts();
+  }
+
+  const doFetch = () => fetch(url, { ...opts, headers });
+
+  let res = await doFetch().catch(() => null);
+  let text = res ? await res.text() : "";
+  let json = null; try { json = text ? JSON.parse(text) : null; } catch {}
+
+  // Auto-recover if backend says "no bridge"
+  if (!(res && res.ok)) {
+    const msg = (json && (json.error || json.message)) || text || "";
+    if (/no bridge/i.test(msg) || /Please query \/accounts first/i.test(msg)) {
+      console.warn(`[IBHTTP RETRY ${opts.method||"GET"}] ${url} -> ${res ? res.status : "ERR"} ${msg}`);
+      await ibWake();
+      await ibReauth();
+      await ibEnsureAccounts();
+      res = await doFetch().catch(() => null);
+      text = res ? await res.text() : "";
+      try { json = text ? JSON.parse(text) : null; } catch {}
+    }
+  }
+
+  if (!(res && res.ok)) {
+    console.warn(`[IBHTTP ${opts.method||"GET"}] ${url} -> ${res ? res.status : "ERR"}`, json || text);
+  }
+  return { ok: !!(res && res.ok), status: res ? res.status : 0, data: json, raw: text };
+}
 /* ================= IBKR: CONID resolution ================= */
 async function ibConidForStock(symbol) {
   symbol = symbol.toUpperCase();
   if (conidBySymbol.has(symbol)) return conidBySymbol.get(symbol);
+  await ibPrimeSession();
   const r = await ibFetch(`/trsrv/stocks?symbols=${encodeURIComponent(symbol)}`);
   const arr = r?.data?.[symbol] || [];
-  // pick first SMART primary
   const best = arr.find(x => (x?.contracts||[]).some(c => c.isUS === true)) || arr[0];
   const conid = best?.contracts?.[0]?.conid || best?.contracts?.[0]?.conidEx || best?.conid;
   if (Number.isFinite(Number(conid))) {
@@ -441,6 +516,7 @@ async function ibConidForStock(symbol) {
 /* ================= IBKR: snapshot for fields ================= */
 const F_BID = 84, F_ASK = 86, F_LAST = 31, F_BIDSZ = 88, F_ASKSZ = 85, F_LASTSZ = 7059;
 async function ibSnapshot(conids, fields = [F_LAST, F_BID, F_ASK]) {
+  await ibPrimeSession();
   const u = `/iserver/marketdata/snapshot?conids=${encodeURIComponent(conids.join(","))}&fields=${fields.join(",")}`;
   const r = await ibFetch(u);
   const list = Array.isArray(r.data) ? r.data : [];
@@ -468,68 +544,412 @@ async function ibGetUlLast(symbol, conid) {
   return Number(last) || 0;
 }
 
+// async function ibGetStrikesExp(symbol, conid, ulPrice) {
+//   const today = new Date();
+//   const months = [];
+//   for (let i=0; i<4; i++) {
+//     const d = new Date(today); d.setMonth(d.getMonth()+i);
+//     const yyyy = d.getUTCFullYear();
+//     const mm = String(d.getUTCMonth()+1).padStart(2,"0");
+//     months.push(`${yyyy}${mm}`);
+//   }
+//   const expirations = new Set();
+//   const strikesSet = new Set();
+
+//   for (const mStr of months) {
+//     const q = `/iserver/secdef/strikes?conid=${conid}&sectype=OPT&month=${mStr}&exchange=SMART&underlyingPrice=${encodeURIComponent(ulPrice)}`;
+//     const r = await ibFetch(q);
+//     const exps = r?.data?.expirations || r?.data?.optExpDate || r?.data?.expirationsMonth || [];
+//     const strikes = r?.data?.strikes || r?.data?.strike || [];
+//     for (const e of exps) expirations.add(String(e));
+//     for (const s of strikes) if (Number.isFinite(Number(s))) strikesSet.add(Number(s));
+//   }
+//   const normalizedExps = Array.from(expirations).map(e => {
+//     if (/^\d{4}-\d{2}-\d{2}$/.test(e)) return e;
+//     if (/^\d{8}$/.test(e)) return `${e.slice(0,4)}-${e.slice(4,6)}-${e.slice(6,8)}`;
+//     return e;
+//   }).filter(within30Days);
+
+//   return { expirations: normalizedExps.sort(), strikes: Array.from(strikesSet).sort((a,b)=>a-b) };
+// }
+
+// async function ibGetStrikesExp(symbol, conid, ulPrice) {
+//   const today = new Date();
+//   const months = [];
+//   for (let i = 0; i < 4; i++) {
+//     const d = new Date(today); d.setMonth(d.getMonth() + i);
+//     const yyyy = d.getUTCFullYear();
+//     const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+//     months.push(`${yyyy}${mm}`);
+//   }
+//   const expirations = new Set();
+//   const strikesSet = new Set();
+
+//   for (const mStr of months) {
+//     // ---- FIX: only include underlyingPrice when > 0
+//     const qp = new URLSearchParams({
+//       conid: String(conid),
+//       sectype: "OPT",
+//       month: mStr,
+//       exchange: "SMART",
+//     });
+//     if (Number(ulPrice) > 0) qp.set("underlyingPrice", String(ulPrice));
+
+//     const q = `/iserver/secdef/strikes?${qp.toString()}`;
+//     const r = await ibFetch(q);
+//     const exps = r?.data?.expirations || r?.data?.optExpDate || r?.data?.expirationsMonth || [];
+//     const strikes = r?.data?.strikes || r?.data?.strike || [];
+//     for (const e of exps) expirations.add(String(e));
+//     for (const s of strikes) if (Number.isFinite(Number(s))) strikesSet.add(Number(s));
+//   }
+
+//   const normalizedExps = Array.from(expirations)
+//     .map(e => (/^\d{8}$/.test(e) ? `${e.slice(0,4)}-${e.slice(4,6)}-${e.slice(6,8)}` : e))
+//     .filter(within30Days)
+//     .sort();
+
+//   return { expirations: normalizedExps, strikes: Array.from(strikesSet).sort((a,b) => a - b) };
+// }
+
+// function pickStrikesNear(strikes, center, limit = MAX_STRIKES_AROUND_ATM) {
+//   if (!Number.isFinite(center) || !strikes?.length) return [];
+//   return strikes
+//     .map(s => ({ s, d: Math.abs(s - center) }))
+//     .sort((a,b)=>a.d - b.d)
+//     .slice(0, Math.min(limit, strikes.length))
+//     .map(x => x.s)
+//     .sort((a,b)=>a-b);
+// }
+// function pickStrikesNear(strikes, center, limit = MAX_STRIKES_AROUND_ATM) {
+//   if (!strikes?.length) return [];
+//   const c = Number.isFinite(center) && center > 0
+//     ? center
+//     : strikes[Math.floor(strikes.length / 2)]; // fallback center
+//   return strikes
+//     .map(s => ({ s, d: Math.abs(s - c) }))
+//     .sort((a,b)=>a.d - b.d)
+//     .slice(0, Math.min(limit, strikes.length))
+//     .map(x => x.s)
+//     .sort((a,b)=>a-b);
+// }
+// async function ibGetStrikesExp(symbol, conid, ulPrice) {
+//   const today = new Date();
+//   const months = [];
+//   for (let i = 0; i < 4; i++) {
+//     const d = new Date(today); d.setMonth(d.getMonth() + i);
+//     const yyyy = d.getUTCFullYear();
+//     const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+//     months.push(`${yyyy}${mm}`);
+//   }
+
+//   const expirations = new Set();
+//   const strikesSet = new Set();
+
+//   for (const mStr of months) {
+//     const qp = new URLSearchParams({ conid: String(conid), sectype: "OPT", month: mStr, exchange: "SMART" });
+//     if (Number(ulPrice) > 0) qp.set("underlyingPrice", String(ulPrice));
+
+//     const q = `/iserver/secdef/strikes?${qp.toString()}`;
+//     const r = await ibFetch(q);
+//     const exps = r?.data?.expirations || r?.data?.optExpDate || r?.data?.expirationsMonth || [];
+//     const strikes = r?.data?.strikes || r?.data?.strike || [];
+//     for (const e of exps) expirations.add(String(e));
+//     for (const s of strikes) if (Number.isFinite(Number(s))) strikesSet.add(Number(s));
+//   }
+
+//   const normalizedExps = Array.from(expirations)
+//     .map(e => (/^\d{8}$/.test(e) ? `${e.slice(0,4)}-${e.slice(4,6)}-${e.slice(6,8)}` : e))
+//     .filter(within30Days)
+//     .sort();
+
+//   return {
+//     expirations: normalizedExps,
+//     strikes: Array.from(strikesSet).sort((a,b)=>a-b)
+//   };
+// }
+
 async function ibGetStrikesExp(symbol, conid, ulPrice) {
-  // month=YYYYMM; if omitted IBKR returns wide set; we filter by expiry days later
-  // We'll ask for a handful of months heuristically around today:
+  // ask several near months to discover expirations; some gateways need month
   const today = new Date();
   const months = [];
-  for (let i=0; i<4; i++) {
-    const d = new Date(today); d.setMonth(d.getMonth()+i);
+  for (let i = 0; i < 4; i++) {
+    const d = new Date(today); d.setMonth(d.getMonth() + i);
     const yyyy = d.getUTCFullYear();
-    const mm = String(d.getUTCMonth()+1).padStart(2,"0");
-    months.push(`${yyyy}${mm}`);
+    const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+    months.push(`${yyyy}${mm}`); // YYYYMM
   }
-  const expirations = new Set();
+
+  const expirationsRaw = new Set();
   const strikesSet = new Set();
 
-  for (const mStr of months) {
-    const q = `/iserver/secdef/strikes?conid=${conid}&sectype=OPT&month=${mStr}&exchange=SMART&underlyingPrice=${encodeURIComponent(ulPrice)}`;
-    const r = await ibFetch(q);
-    const exps = r?.data?.expirations || r?.data?.optExpDate || r?.data?.expirationsMonth || [];
-    const strikes = r?.data?.strikes || r?.data?.strike || [];
-    for (const e of exps) expirations.add(String(e));
-    for (const s of strikes) if (Number.isFinite(Number(s))) strikesSet.add(Number(s));
-  }
-  // Filter expirations within 30 days; normalize to YYYY-MM-DD if needed
-  const normalizedExps = Array.from(expirations).map(e => {
-    if (/^\d{4}-\d{2}-\d{2}$/.test(e)) return e;
-    if (/^\d{8}$/.test(e)) return `${e.slice(0,4)}-${e.slice(4,6)}-${e.slice(6,8)}`;
-    return e;
-  }).filter(within30Days);
+  // helper to deeply collect any array of YYYYMMDD/ YYYY-MM-DD under typical keys
+  const collect = (obj) => {
+    if (!obj || typeof obj !== "object") return;
+    const maybeArrs = [
+      obj.expirations, obj.optExpDate, obj.expirationsMonth, obj.expiration, obj.expiry, obj.expDates
+    ].filter(Boolean);
+    for (const v of maybeArrs) {
+      if (Array.isArray(v)) for (const e of v) expirationsRaw.add(String(e));
+      else if (typeof v === "object") collect(v);
+    }
+    const strikes = obj.strikes || obj.strike || obj.strikePrices;
+    if (Array.isArray(strikes)) for (const s of strikes) if (Number.isFinite(Number(s))) strikesSet.add(Number(s));
+  };
 
-  return { expirations: normalizedExps.sort(), strikes: Array.from(strikesSet).sort((a,b)=>a-b) };
+  for (const mStr of months) {
+    const q = `/iserver/secdef/strikes?conid=${conid}&sectype=OPT&month=${mStr}&exchange=SMART` +
+              (Number.isFinite(ulPrice) && ulPrice > 0 ? `&underlyingPrice=${encodeURIComponent(ulPrice)}` : "");
+    const r = await ibFetch(q);
+    if (r?.data) collect(r.data);
+  }
+
+  // normalize expirations -> YYYY-MM-DD and keep only within 30 days
+  const normalizeExp = (e) => {
+    const s = String(e);
+    if (/^\d{8}$/.test(s)) return `${s.slice(0,4)}-${s.slice(4,6)}-${s.slice(6,8)}`;
+    if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+    return null;
+  };
+  const exps30d = Array.from(expirationsRaw)
+    .map(normalizeExp)
+    .filter(Boolean)
+    .filter(within30Days)
+    .sort();
+
+  return { expirations: exps30d, strikes: Array.from(strikesSet).sort((a,b)=>a-b) };
 }
 
 function pickStrikesNear(strikes, center, limit = MAX_STRIKES_AROUND_ATM) {
-  if (!Number.isFinite(center) || !strikes?.length) return [];
+  if (!strikes?.length) return [];
+  const c = Number.isFinite(center) && center > 0
+    ? center
+    : strikes[Math.floor(strikes.length / 2)]; // fallback to median
   return strikes
-    .map(s => ({ s, d: Math.abs(s - center) }))
+    .map(s => ({ s, d: Math.abs(s - c) }))
     .sort((a,b)=>a.d - b.d)
     .slice(0, Math.min(limit, strikes.length))
     .map(x => x.s)
     .sort((a,b)=>a-b);
 }
+// async function ensureChainsForUL(symbol) {
+//   const ul = String(symbol).toUpperCase();
+//   const ulConid = await ibConidForStock(ul);
+//   if (!ulConid) return;
+
+//   // try to center strikes on live last; fall back to median
+//   let last = 0;
+//   try {
+//     const snap = await ibSnapshot([ulConid], [F_LAST, F_BID, F_ASK]);
+//     const row = snap.get(ulConid);
+//     last = (row?.last || row?.bid || row?.ask || 0) || 0;
+//   } catch {}
+
+//   const { expirations, strikes } = await ibGetStrikesExp(ul, ulConid, last);
+//   if (!expirations.length || !strikes.length) return;
+
+//   const bestStrikes = pickStrikesNear(strikes, last, MAX_STRIKES_AROUND_ATM);
+//   const ts = Date.now();
+//   for (const exp of expirations) {
+//     pushAndFanout({
+//       id: `${ul}-${exp}-${ts}-${Math.random().toString(36).slice(2,7)}`,
+//       ts,
+//       type: "chains",
+//       provider: "ibkr",
+//       symbol: ul,
+//       expiration: exp,
+//       strikes: bestStrikes,
+//       strikesCount: bestStrikes.length
+//     });
+//   }
+// }
+async function ensureChainsForUL(symbol) {
+  const ulConid = await ibConidForStock(symbol);
+  if (!ulConid) return;
+
+  const last = await ibGetUlLast(symbol, ulConid);
+  const { expirations, strikes } = await ibGetStrikesExp(symbol, ulConid, last);
+  if (!expirations.length || !strikes.length) return;
+
+  const bestStrikes = pickStrikesNear(strikes, last, MAX_STRIKES_AROUND_ATM);
+
+  for (const exp of expirations) {
+    pushAndFanout({
+      type: "chains",
+      provider: "ibkr",
+      ts: Date.now(),
+      symbol,
+      expiration: exp,
+      strikes: bestStrikes,
+      strikesCount: bestStrikes.length
+    });
+  }
+}
+
+app.get("/debug/expirations", async (req, res) => {
+  try {
+    const symbol = String(req.query.symbol || "").toUpperCase();
+    if (!symbol) return res.status(400).json({ error: "symbol required" });
+    const conid = await ibConidForStock(symbol);
+    if (!conid) return res.status(404).json({ error: "no conid for symbol" });
+
+    const r = await ibFetch(`/iserver/secdef/strikes?conid=${conid}&sectype=OPT&exchange=SMART`);
+    const exps = r?.data?.expirations || r?.data?.optExpDate || r?.data?.expirationsMonth || [];
+    const out = exps.map(e => (/^\d{8}$/.test(e) ? `${e.slice(0,4)}-${e.slice(4,6)}-${e.slice(6,8)}` : e));
+    res.json({ symbol, conid, expirations: out });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
 
 // Resolve option contract conid via /iserver/secdef/info
+// async function ibOptionConid(ulConid, { expISO, right, strike }) {
+//   const month = expISO.slice(0,7).replace("-", "");
+//   await ibPrimeSession();
+//   const url = `/iserver/secdef/info?conid=${ulConid}&sectype=OPT&month=${month}&right=${right[0]}&strike=${encodeURIComponent(strike)}`;
+//   const r = await ibFetch(url);
+//   const list = Array.isArray(r.data) ? r.data : (Array.isArray(r.data?.contracts) ? r.data.contracts : []);
+//   let best = null;
+//   for (const c of list) {
+//     const cx = c || {};
+//     const cexp = String(cx.expiration || cx.lastTradingDay || "");
+//     const expN = /^\d{8}$/.test(cexp) ? `${cexp.slice(0,4)}-${cexp.slice(4,6)}-${cexp.slice(6,8)}` : cexp;
+//     const okRight = String(cx.right || cx.optRight || "").toUpperCase().startsWith(right[0]);
+//     const okStrike = Math.abs(Number(cx.strike || cx.strikePrice) - Number(strike)) < 1e-6;
+//     if (okRight && okStrike && expN === expISO) { best = cx; break; }
+//   }
+//   const conid = Number(best?.conid || best?.conidEx);
+//   return Number.isFinite(conid) ? conid : null;
+// }
+// Resolve option contract conid via /iserver/secdef/info
+// async function ibOptionConid(ulConid, { expISO, right, strike }) {
+//   // ---- FIX: remove *all* dashes and pass YYYYMM ----
+//   // expISO is "YYYY-MM-DD" -> "YYYYMM"
+//   const month = expISO.replace(/-/g, "").slice(0, 6);
+
+//   const url = `/iserver/secdef/info?conid=${ulConid}&sectype=OPT&month=${month}&right=${right[0]}&strike=${encodeURIComponent(strike)}`;
+//   const r = await ibFetch(url);
+//   const list = Array.isArray(r.data) ? r.data : (Array.isArray(r.data?.contracts) ? r.data.contracts : []);
+//   let best = null;
+//   for (const c of list) {
+//     const cx = c || {};
+//     const cexp = String(cx.expiration || cx.lastTradingDay || "");
+//     const expN = /^\d{8}$/.test(cexp) ? `${cexp.slice(0,4)}-${cexp.slice(4,6)}-${cexp.slice(6,8)}` : cexp;
+//     const okRight = String(cx.right || cx.optRight || "").toUpperCase().startsWith(right[0]);
+//     const okStrike = Math.abs(Number(cx.strike || cx.strikePrice) - Number(strike)) < 1e-6;
+//     if (okRight && okStrike && expN === expISO) { best = cx; break; }
+//   }
+//   const conid = Number(best?.conid || best?.conidEx);
+//   return Number.isFinite(conid) ? conid : null;
+// }
+// --- utils used below ---
+const toYYYYMM = (expISO) => expISO.replace(/-/g, "").slice(0, 6);
+const isYYYYMMDD = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s);
+const toYYYY_MM_DD = (yyyymmdd) => `${yyyymmdd.slice(0,4)}-${yyyymmdd.slice(4,6)}-${yyyymmdd.slice(6,8)}`;
+
+// async function ibOptionConid(ulConid, { expISO, right, strike }) {
+//   // Normalize params
+//   if (!isYYYYMMDD(expISO)) throw new Error(`expISO must be YYYY-MM-DD, got: ${expISO}`);
+//   const month = toYYYYMM(expISO);
+//   const R = String(right).toUpperCase().startsWith("C") ? "C" : "P";
+
+//   // Helper: attempt a single /secdef/info query
+//   const tryInfo = async (strikeStr) => {
+//     const url = `/iserver/secdef/info?conid=${ulConid}&sectype=OPT&month=${month}&exchange=SMART&right=${R}&strike=${encodeURIComponent(strikeStr)}`;
+//     const r = await ibFetch(url);
+//     const arr = Array.isArray(r.data) ? r.data : (Array.isArray(r.data?.contracts) ? r.data.contracts : []);
+//     if (!arr.length) return null;
+
+//     // Pick exact expiration = expISO if possible; else best in same month
+//     let best = null;
+//     let bestScore = Infinity;
+//     for (const c of arr) {
+//       const rawExp = String(c.expiration || c.lastTradingDay || "");
+//       const expN = /^\d{8}$/.test(rawExp) ? toYYYY_MM_DD(rawExp) : rawExp;
+//       const k = Number(c.strike ?? c.strikePrice);
+//       const score =
+//         (expN === expISO ? 0 : 10) + // exact date gets priority
+//         Math.abs(Number(k) - Number(strike)); // closest strike
+//       if (score < bestScore) { bestScore = score; best = c; }
+//     }
+//     const conid = Number(best?.conid || best?.conidEx);
+//     return Number.isFinite(conid) ? { conid, best } : null;
+//   };
+
+//   // Try with integer (e.g., 200) and 3dp (e.g., 200.000)
+//   const sInt = String(Number(strike));        // "200"
+//   const s3dp = Number(strike).toFixed(3);     // "200.000"
+//   let hit = await tryInfo(sInt) || await tryInfo(s3dp);
+//   if (hit) return hit.conid;
+
+//   // If no hits, the client may have passed a non-listed date.
+//   // Ask IBKR for **listed expirations in this month** and retry on the closest Friday.
+//   const monthYYYY = month.slice(0,4);
+//   const monthMM   = month.slice(4,6);
+
+//   // Get strikes to also fetch expirations from /secdef/strikes
+//   // (it returns both strikes and expirations; underlyingPrice not required here)
+//   const r2 = await ibFetch(`/iserver/secdef/strikes?conid=${ulConid}&sectype=OPT&month=${month}&exchange=SMART`);
+//   const exps = r2?.data?.expirations || r2?.data?.optExpDate || r2?.data?.expirationsMonth || [];
+//   const listed = exps
+//     .map(e => /^\d{8}$/.test(e) ? toYYYY_MM_DD(e) : String(e))
+//     .filter(e => isYYYYMMDD(e) && e.slice(0,7) === `${monthYYYY}-${monthMM}`);
+
+//   // Choose the listed date closest to the requested expISO
+//   let expPick = listed.find(e => e === expISO);
+//   if (!expPick && listed.length) {
+//     const target = Date.parse(expISO);
+//     let bestD = Infinity;
+//     for (const e of listed) {
+//       const d = Math.abs(Date.parse(e) - target);
+//       if (d < bestD) { bestD = d; expPick = e; }
+//     }
+//   }
+//   if (!expPick) return null;
+
+//   // Try again with the chosen **listed** expiration's month (same month) & strike variants
+//   const sInt2 = sInt;
+//   const s3dp2 = s3dp;
+//   hit = await tryInfo(sInt2) || await tryInfo(s3dp2);
+//   return hit ? hit.conid : null;
+// }
+
 async function ibOptionConid(ulConid, { expISO, right, strike }) {
-  // month param accepts YYYYMM or "D" for all? We'll pass YYYYMM from exp.
-  const month = expISO.slice(0,7).replace("-", "");
-  const url = `/iserver/secdef/info?conid=${ulConid}&sectype=OPT&month=${month}&right=${right[0]}&strike=${encodeURIComponent(strike)}`;
-  const r = await ibFetch(url);
-  // Response can be array of contracts; pick closest matching expiration date
-  const list = Array.isArray(r.data) ? r.data : (Array.isArray(r.data?.contracts) ? r.data.contracts : []);
-  let best = null;
-  for (const c of list) {
-    const cx = c || {};
-    const cexp = String(cx.expiration || cx.lastTradingDay || "");
-    // Try to normalize to YYYY-MM-DD
-    const expN = /^\d{8}$/.test(cexp) ? `${cexp.slice(0,4)}-${cexp.slice(4,6)}-${cexp.slice(6,8)}` : cexp;
-    const okRight = String(cx.right || cx.optRight || "").toUpperCase().startsWith(right[0]);
-    const okStrike = Math.abs(Number(cx.strike || cx.strikePrice) - Number(strike)) < 1e-6;
-    if (okRight && okStrike && expN === expISO) { best = cx; break; }
+  // right: "CALL" | "PUT"
+  const cp = right[0].toUpperCase(); // "C" or "P"
+  const yyyymm   = expISO.replace(/-/g, "").slice(0, 6); // 202512
+  const yyyymmdd = expISO.replace(/-/g, "");             // 20251219 (for monthlies/weeklies)
+  const k = String(Number(strike));                       // plain decimal (no zero padding)
+
+  const tryUrls = [
+    // Many gateways accept month=YYYYMM + exchange
+    `/iserver/secdef/info?conid=${ulConid}&sectype=OPT&month=${yyyymm}&exchange=SMART&right=${cp}&strike=${encodeURIComponent(k)}`,
+    // Some require full expiry via month=YYYYMMDD
+    `/iserver/secdef/info?conid=${ulConid}&sectype=OPT&month=${yyyymmdd}&exchange=SMART&right=${cp}&strike=${encodeURIComponent(k)}`,
+    // Some accept expiry= instead of month=
+    `/iserver/secdef/info?conid=${ulConid}&sectype=OPT&expiry=${yyyymmdd}&exchange=SMART&right=${cp}&strike=${encodeURIComponent(k)}`
+  ];
+
+  for (const url of tryUrls) {
+    const r = await ibFetch(url);
+    const list = Array.isArray(r.data) ? r.data
+      : (Array.isArray(r.data?.contracts) ? r.data.contracts : null);
+
+    if (!list || !list.length) continue;
+
+    // pick exact match on expiry/right/strike
+    let best = null;
+    for (const c of list) {
+      const cx = c || {};
+      const exp = String(cx.expiration || cx.lastTradingDay || "");
+      const expN = /^\d{8}$/.test(exp) ? `${exp.slice(0,4)}-${exp.slice(4,6)}-${exp.slice(6,8)}` : exp;
+      const okRight  = String(cx.right || cx.optRight || "").toUpperCase().startsWith(cp);
+      const okStrike = Math.abs(Number(cx.strike || cx.strikePrice) - Number(strike)) < 1e-6;
+      if (okRight && okStrike && expN === expISO) { best = cx; break; }
+    }
+    const conid = Number(best?.conid || best?.conidEx);
+    if (Number.isFinite(conid)) return conid;
   }
-  const conid = Number(best?.conid || best?.conidEx);
-  return Number.isFinite(conid) ? conid : null;
+  return null;
 }
 
 async function expandAndWatchChainIBKR(ul) {
@@ -544,7 +964,6 @@ async function expandAndWatchChainIBKR(ul) {
   const bestStrikes = pickStrikesNear(strikes, last || strikes[Math.floor(strikes.length/2)] || 0);
 
   for (const exp of expirations) {
-    // fan-out an informational 'chains' event (for your UI)
     pushAndFanout({
       type: "chains", provider: "ibkr", ts: Date.now(),
       symbol, expiration: exp, strikes: bestStrikes, strikesCount: bestStrikes.length
@@ -552,7 +971,6 @@ async function expandAndWatchChainIBKR(ul) {
 
     for (const k of bestStrikes) {
       for (const right of ["CALL","PUT"]) {
-        // Ensure option conid, then subscribe via WS
         const conid = await ibOptionConid(ulConid, { expISO: exp, right, strike: k });
         if (!conid) continue;
         const occ = toOcc(symbol, exp, right, k);
@@ -560,7 +978,6 @@ async function expandAndWatchChainIBKR(ul) {
         optionMetaByConid.set(conid, { ul: symbol, exp: exp, right, strike: k, occ });
         await ibWsEnsure();
         ibWsSubscribe(conid);
-        // NBBO will arrive via WS; snapshot once to seed NBBO
         const snap = await ibSnapshot([conid], [F_BID, F_ASK]);
         const row = snap.get(conid);
         if (row) optNBBO.set(occ, { bid: row.bid||0, ask: row.ask||0, ts: Date.now() });
@@ -577,9 +994,10 @@ let ibHeartbeatTimer = null;
 
 async function ibWsEnsure() {
   if (MOCK) return;
-  if (ibWsReady) return;
-  if (ibWsConnecting) return;
+  if (ibWsReady || ibWsConnecting) return;
   ibWsConnecting = true;
+
+  await ibPrimeSession();
 
   ibWs = new WebSocket(IB_WS_URL, {
     headers: IB_COOKIE ? { Cookie: IB_COOKIE } : {},
@@ -588,11 +1006,9 @@ async function ibWsEnsure() {
 
   ibWs.on("open", () => {
     ibWsReady = true; ibWsConnecting = false;
-    // Resubscribe all known conids
     for (const c of conidsSubscribed) {
       try { ibWs.send(`smd+${c}+{"fields":[${[F_LAST,F_BID,F_ASK,F_BIDSZ,F_ASKSZ,F_LASTSZ].join(",")}]} `); } catch {}
     }
-    // heartbeat every 10s
     clearInterval(ibHeartbeatTimer);
     ibHeartbeatTimer = setInterval(() => { try { ibWs?.send?.("ech+hb"); } catch {} }, 10000);
   });
@@ -600,17 +1016,13 @@ async function ibWsEnsure() {
   ibWs.on("message", (buf) => {
     try {
       const s = String(buf);
-      // CP can send newline-delimited JSON or an array payload
       const chunks = s.split(/\r?\n/).filter(Boolean);
       for (const line of chunks) {
         let msg; try { msg = JSON.parse(line); } catch { continue; }
-        // Market data: topic 'smd' or payload with 'data' array
         const rows = Array.isArray(msg?.data) ? msg.data : (Array.isArray(msg) ? msg : [msg]);
         for (const row of rows) handleIbTick(row);
       }
-    } catch (e) {
-      // ignore parse errors
-    }
+    } catch {}
   });
 
   ibWs.on("close", () => {
@@ -660,7 +1072,6 @@ function handleIbTick(row) {
   lastTradeKeyByConid.set(conid, nowKey);
 
   if (meta) {
-    // options print
     const occ = meta.occ;
     const nbbo = optNBBO.get(occ);
     const side = classifyAggressor(last, nbbo).side;
@@ -724,7 +1135,6 @@ function handleIbTick(row) {
     }
     optLastPrintTs.set(occ, Date.now());
   } else if (sym) {
-    // equity print (approx from last/lastSize)
     const eqMsg = normEquityPrint("ibkr", { symbol: sym, price: last, size: lastSize });
     pushAndFanout(eqMsg);
   }
@@ -733,19 +1143,15 @@ function handleIbTick(row) {
 /* ================= FALLBACK SNAPSHOT POLLER (light) ================= */
 async function pollSnapshotsOnce() {
   if (MOCK) return;
-  // refresh NBBO for all eq & opt conids we know
   const allConids = new Set();
   for (const c of eqConids.values()) allConids.add(c);
   for (const c of optionMetaByConid.keys()) allConids.add(c);
   if (!allConids.size) return;
 
-  const list = Array.from(allConids).slice(0, 50); // batch small
+  const list = Array.from(allConids).slice(0, 50); // tiny batch
   const snap = await ibSnapshot(list, [F_BID, F_ASK, F_LAST, F_LASTSZ]);
   for (const [conid, row] of snap.entries()) {
-    updateNBBOFromRow(conid, {
-      [F_BID]: row.bid, [F_ASK]: row.ask
-    });
-    // if we see a new last/lastSize combo, push lightweight trade (dedup with key)
+    updateNBBOFromRow(conid, { [F_BID]: row.bid, [F_ASK]: row.ask });
     const key = `${row.last}@${row.lastSize}`;
     if (row.last > 0 && row.lastSize > 0 && key !== lastTradeKeyByConid.get(conid)) {
       lastTradeKeyByConid.set(conid, key);
@@ -787,7 +1193,7 @@ app.get("/watch/symbols", (_req, res) => {
   res.json({
     ok: true,
     watching: {
-      equities: Array.from(alpacaSubs), // keep name for UI
+      equities: Array.from(alpacaSubs),
       options: Array.from(tradierOptWatch.set).map(JSON.parse),
     },
   });
@@ -803,15 +1209,14 @@ app.post("/watch/symbols", async (req, res) => {
   if (!MOCK) {
     await ibWsEnsure();
     for (const s of symbols) {
-      // equities subscribe
       const conid = await ibConidForStock(s);
       if (conid) {
         eqConids.set(s, conid);
         symbolByConid.set(conid, s);
         ibWsSubscribe(conid);
       }
-      // options auto-expand
       await expandAndWatchChainIBKR(s);
+      await ensureChainsForUL(s); // <— add this line
     }
   }
   res.json({ ok: true, added, watching: { equities: Array.from(alpacaSubs) } });
@@ -824,7 +1229,6 @@ app.delete("/watch/symbols", async (req, res) => {
   let removed = 0;
   for (const s of symbols) if ( alpacaSubs.delete(s) ) removed++;
 
-  // prune options (same behavior as original)
   const before = tradierOptWatch.set.size;
   for (const entry of Array.from(tradierOptWatch.set)) {
     try {
@@ -839,49 +1243,163 @@ app.delete("/watch/symbols", async (req, res) => {
     options: Array.from(tradierOptWatch.set).map(JSON.parse)
   } });
 });
-
-// Maintain original shape; we map it to IBKR chain expansion
 app.post("/watch/tradier", async (req, res) => {
-  const options = Array.isArray(req.body?.options) ? req.body.options : [];
-  let added = 0;
+  const inList = Array.isArray(req.body?.options) ? req.body.options : [];
+  if (!inList.length) return res.json({ ok: true, watching: { options: Array.from(tradierOptWatch.set).map(JSON.parse) }, added: 0 });
 
-  for (const o of options) {
-    const entry = JSON.stringify({
-      underlying: String(o.underlying).toUpperCase(),
-      expiration: String(o.expiration),
-      strike: Number(o.strike),
-      right: String(o.right).toUpperCase()
-    });
+  // helper: normalize
+  const canon = (o) => {
+    const ul = String(o.underlying || o.ul || "").toUpperCase().trim();
+    let exp = String(o.expiration || o.exp || "").trim();
+    // allow YYYYMMDD or YYYY-MM-DD
+    if (/^\d{8}$/.test(exp)) exp = `${exp.slice(0,4)}-${exp.slice(4,6)}-${exp.slice(6,8)}`;
+    const k = Number(o.strike);
+    let r = String(o.right || o.cp || "").toUpperCase().trim();
+    r = r.startsWith("C") ? "C" : r.startsWith("P") ? "P" : r; // collapse
+    return { underlying: ul, expiration: exp, strike: k, right: r };
+  };
+
+  // convert to canonical entries, drop invalids
+  const wanted = inList.map(canon)
+    .filter(o => o.underlying && /^\d{4}-\d{2}-\d{2}$/.test(o.expiration) && Number.isFinite(o.strike) && (o.right === "C" || o.right === "P"));
+
+  // dedupe by OCC key
+  const byOcc = new Map();
+  for (const o of wanted) {
+    const occ = toOcc(o.underlying, o.expiration, o.right === "C" ? "CALL" : "PUT", o.strike);
+    byOcc.set(occ, o);
+  }
+
+  // add to watch set using canonical JSON
+  let added = 0;
+  for (const o of byOcc.values()) {
+    const entry = JSON.stringify(o); // canonical
     if (!tradierOptWatch.set.has(entry)) { tradierOptWatch.set.add(entry); added++; }
   }
 
-  // Ensure these options are resolved to conids & subscribed
+  // subscribe those options in IBKR
   if (!MOCK) {
     await ibWsEnsure();
+
+    // group by UL to resolve ul conid once
     const groups = {};
-    for (const o of options) {
-      const ul = String(o.underlying).toUpperCase();
-      groups[ul] = groups[ul] || [];
-      groups[ul].push(o);
+    for (const o of byOcc.values()) {
+      (groups[o.underlying] ||= []).push(o);
     }
+
     for (const [ul, list] of Object.entries(groups)) {
       const ulConid = await ibConidForStock(ul);
       if (!ulConid) continue;
+
       for (const o of list) {
-        const exp = String(o.expiration);
-        const right = String(o.right).toUpperCase();
-        const k = Number(o.strike);
-        const conid = await ibOptionConid(ulConid, { expISO: exp, right, strike: k });
+        const rightFull = o.right === "C" ? "CALL" : "PUT";
+        const conid = await ibOptionConid(ulConid, { expISO: o.expiration, right: rightFull, strike: o.strike });
         if (!conid) continue;
-        const occ = toOcc(ul, exp, right, k);
+        const occ = toOcc(ul, o.expiration, rightFull, o.strike);
         occToConid.set(occ, conid);
-        optionMetaByConid.set(conid, { ul, exp, right, strike: k, occ });
+        optionMetaByConid.set(conid, { ul, exp: o.expiration, right: rightFull, strike: o.strike, occ });
         ibWsSubscribe(conid);
       }
+
+      // also emit chains for the UL so your client populates the chains panel
+      await ensureChainsForUL(ul);
     }
   }
 
   res.json({ ok: true, watching: { options: Array.from(tradierOptWatch.set).map(JSON.parse) }, added });
+});
+app.post("/debug/normalize-watch", (_req, res) => {
+  const items = Array.from(tradierOptWatch.set).map(s => {
+    try { return JSON.parse(s); } catch { return null; }
+  }).filter(Boolean);
+
+  const canon = (o) => {
+    const ul = String(o.underlying || "").toUpperCase().trim();
+    let exp = String(o.expiration || "").trim();
+    if (/^\d{8}$/.test(exp)) exp = `${exp.slice(0,4)}-${exp.slice(4,6)}-${exp.slice(6,8)}`;
+    const k = Number(o.strike);
+    let r = String(o.right || "").toUpperCase().trim();
+    r = r.startsWith("C") ? "C" : r.startsWith("P") ? "P" : r;
+    return { underlying: ul, expiration: exp, strike: k, right: r };
+  };
+
+  const byOcc = new Map();
+  for (const o of items) {
+    const c = canon(o);
+    if (!c.underlying || !/^\d{4}-\d{2}-\d{2}$/.test(c.expiration) || !Number.isFinite(c.strike) || !["C","P"].includes(c.right)) continue;
+    const occ = toOcc(c.underlying, c.expiration, c.right === "C" ? "CALL" : "PUT", c.strike);
+    byOcc.set(occ, c);
+  }
+
+  tradierOptWatch.set.clear();
+  for (const c of byOcc.values()) tradierOptWatch.set.add(JSON.stringify(c));
+
+  res.json({ ok: true, count: tradierOptWatch.set.size, sample: Array.from(tradierOptWatch.set).slice(0,5).map(JSON.parse) });
+});
+
+app.get("/debug/expirations", async (req, res) => {
+  const symbol = String(req.query.symbol || "").toUpperCase();
+  if (!symbol) return res.status(400).json({ error: "symbol required" });
+  const ulConid = await ibConidForStock(symbol);
+  if (!ulConid) return res.status(404).json({ error: "unknown symbol" });
+  const lastMap = await ibSnapshot([ulConid], [F_LAST, F_BID, F_ASK]);
+  const last = (lastMap.get(ulConid)?.last || 0);
+  const { expirations } = await ibGetStrikesExp(symbol, ulConid, last);
+  res.json({ symbol, expirations });
+});
+
+// app.post("/watch/tradier", async (req, res) => {
+//   const options = Array.isArray(req.body?.options) ? req.body.options : [];
+//   let added = 0;
+
+//   for (const o of options) {
+//     const entry = JSON.stringify({
+//       underlying: String(o.underlying).toUpperCase(),
+//       expiration: String(o.expiration),
+//       strike: Number(o.strike),
+//       right: String(o.right).toUpperCase()
+//     });
+//     if (!tradierOptWatch.set.has(entry)) { tradierOptWatch.set.add(entry); added++; }
+//   }
+
+//   if (!MOCK) {
+//     await ibWsEnsure();
+//     const groups = {};
+//     for (const o of options) {
+//       const ul = String(o.underlying).toUpperCase();
+//       groups[ul] = groups[ul] || [];
+//       groups[ul].push(o);
+//     }
+//     for (const [ul, list] of Object.entries(groups)) {
+//       const ulConid = await ibConidForStock(ul);
+//       if (!ulConid) continue;
+//       for (const o of list) {
+//         const exp = String(o.expiration);
+//         const right = String(o.right).toUpperCase();
+//         const k = Number(o.strike);
+//         const conid = await ibOptionConid(ulConid, { expISO: exp, right, strike: k });
+//         if (!conid) continue;
+//         const occ = toOcc(ul, exp, right, k);
+//         occToConid.set(occ, conid);
+//         optionMetaByConid.set(conid, { ul, exp, right, strike: k, occ });
+//         ibWsSubscribe(conid);
+//       }
+//       await ensureChainsForUL(ul); // <— add this line
+//     }
+//   }
+
+//   res.json({ ok: true, watching: { options: Array.from(tradierOptWatch.set).map(JSON.parse) }, added });
+// });
+
+app.post("/watch/refresh-chains", async (req, res) => {
+  const symbol = String(req.body?.symbol || "").toUpperCase();
+  if (!symbol) return res.status(400).json({ ok:false, error: "symbol required" });
+  try {
+    await ensureChainsForUL(symbol);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok:false, error: String(e) });
+  }
 });
 
 app.delete("/watch/tradier", (req, res) => {
@@ -899,7 +1417,7 @@ app.delete("/watch/tradier", (req, res) => {
   res.json({ ok: true, removed, watching: { options: Array.from(tradierOptWatch.set).map(JSON.parse) } });
 });
 
-// (kept for UI compat; no-ops w.r.t. IBKR)
+// For UI compat (kept)
 app.post("/watch/alpaca", async (req, res) => {
   const equities = new Set([...(req.body?.equities || [])].map(s => String(s).toUpperCase()).filter(Boolean));
   let added = 0;
@@ -914,6 +1432,7 @@ app.post("/watch/alpaca", async (req, res) => {
         ibWsSubscribe(conid);
       }
       await expandAndWatchChainIBKR(s);
+      await ensureChainsForUL(s); // <— add this line
     }
   }
   res.json({ ok: true, watching: { equities: Array.from(alpacaSubs) }, added });
@@ -1024,5 +1543,7 @@ app.use((err, req, res, next) => {
 });
 
 /* ================= START ================= */
-server.listen(PORT, () => console.log(`HTTP+WS @ :${PORT}  MOCK=${MOCK ? "on" : "off"}  IB=${IB_BASE}`));
-
+server.listen(PORT, async () => {
+  console.log(`HTTP+WS @ :${PORT}  MOCK=${MOCK ? "on" : "off"}  IB=${IB_BASE}`);
+  await ibPrimeSession(); // proactive prime to avoid first-call errors
+});
