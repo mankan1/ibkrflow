@@ -1,0 +1,21 @@
+{
+  "equities": [
+    "AAPL",
+    "NVDA",
+    "MSFT"
+  ],
+  "options": [
+    {
+      "underlying": "AAPL",
+      "expiration": "2025-12-19",
+      "strike": 200,
+      "right": "C"
+    },
+    {
+      "underlying": "NVDA",
+      "expiration": "2025-12-19",
+      "strike": 150,
+      "right": "P"
+    }
+  ]
+}
