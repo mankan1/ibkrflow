@@ -13,6 +13,8 @@ import morgan from "morgan";
 import { WebSocketServer } from "ws";
 import fs from "fs";
 
+import { buildNotables } from './insights/notables.js';
+
 import { router as watchlistRouter } from "./routes/watchlist.js";
 import { loadWatchlistFile, saveWatchlistFile, buildOptionsAroundATM } from "./watchlist.js";
 
@@ -72,11 +74,23 @@ if (String(process.env.NODE_TLS_REJECT_UNAUTHORIZED) === "0") {
 console.log(`HTTP+WS @ :${PORT}  MOCK=${MOCK?"on":"off"}  IB=${IB_BASE}`);
 
 /* ================= APP/WS ================= */
-const app = express();
+// const app = express();
 
+// app.use(express.json());
+// app.use("/watchlist", watchlistRouter);
+// app.use(cors());                // if you need to lock this down: cors({ origin: [/localhost/, /tradeflow\.lol$/] })
+
+const app = express();
+app.use(cors({                 // allow your dev client
+  origin: ["http://localhost:8081", "http://127.0.0.1:8081"],
+  methods: ["GET","POST","DELETE","OPTIONS"],
+  allowedHeaders: ["Content-Type","Authorization"],
+  credentials: false           // set true only if you use cookies/auth
+}));
+app.options("*", cors());      // handle preflight for all routes
 app.use(express.json());
 app.use("/watchlist", watchlistRouter);
-app.use(cors());                // if you need to lock this down: cors({ origin: [/localhost/, /tradeflow\.lol$/] })
+
 app.use(compression());
 app.use(morgan("dev"));
 const FUT_ALIASES = new Map([["/ES","ES"], ["ES","ES"]]);
@@ -123,6 +137,16 @@ function maybePublishSweepOrBlock(msg) {
 
   if (seenRecently(k, DEDUP_MS)) return;
 
+  // classify aggressor vs mid for display
+  let aggressor = "UNKNOWN";
+  const bid = msg.nbbo?.bid ?? (NBBO_OPT.get(toOcc(msg.symbol, msg.option?.expiration, msg.option?.right, msg.option?.strike))?.bid);
+  const ask = msg.nbbo?.ask ?? (NBBO_OPT.get(toOcc(msg.symbol, msg.option?.expiration, msg.option?.right, msg.option?.strike))?.ask);
+  if (Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 && ask > 0) {
+    const mid = (bid + ask) / 2;
+    const bps = ((msg.price - mid) / mid) * 1e4;
+    aggressor = bps >= TAPE_CFG.sweep.atAskBps ? "AT_ASK" : (bps <= -TAPE_CFG.sweep.atAskBps ? "AT_BID" : "NEAR_MID");
+  }
+
   const base = {
     id: `${Date.now()}-${Math.random().toString(36).slice(2,8)}`,
     ts: Date.now(),
@@ -134,6 +158,9 @@ function maybePublishSweepOrBlock(msg) {
     side: msg.side,
     qty: msg.qty,
     price: msg.price,
+    bid,
+    ask,
+    aggressor,  // AT_ASK / AT_BID / NEAR_MID / UNKNOWN
     notional,
   };
 
@@ -164,16 +191,33 @@ const POPULAR_50 = [
   "UNH","JNJ","MRK","PFE","COST","HD","DIS"
 ];
 
-const DEFAULT_EQUITIES =
-  (process.env.DEFAULT_EQUITIES || POPULAR_50.join(","))
-    .split(",")
-    .map(s => s.trim().toUpperCase())
-    .filter(Boolean);
-
+const SEED_ON_EMPTY = String(process.env.SEED_ON_EMPTY || "").trim() === "1";
+// const DEFAULT_EQUITIES =
+//   (process.env.DEFAULT_EQUITIES || POPULAR_50.join(","))
+//     .split(",")
+//     .map(s => s.trim().toUpperCase())
+//     .filter(Boolean);
+// DEFAULT_EQUITIES only used for DEMO/SEED paths (not for normal boot)
+const DEFAULT_EQUITIES = (process.env.DEFAULT_EQUITIES || POPULAR_50.join(","))
+  .split(",")
+  .map(s => s.trim().toUpperCase())
+  .filter(Boolean);
+ 
 // during startup, if your in-mem watchlist is empty:
-if (WATCH.equities.size === 0) {
-  DEFAULT_EQUITIES.forEach(s => addEquity(s));
-  // optionally persist
+// if (WATCH.equities.size === 0) {
+//   DEFAULT_EQUITIES.forEach(s => addEquity(s));
+//   // optionally persist
+// }
+// ---- Do NOT auto-seed on normal boot ----
+// If you really want to seed when empty, set SEED_ON_EMPTY=1
+if (SEED_ON_EMPTY && (WATCH.equities.size === 0) && !fs.existsSync(SEED_MARK)) {
+  (async () => {
+    for (const s of DEFAULT_EQUITIES) await addEquity(s);
+    fs.writeFileSync(SEED_MARK, new Date().toISOString());
+    // wsBroadcast("watchlist", getWatchlist());
+    wsBroadcast("watchlist", makeWatchlistPayload());
+    console.log("[seed] SEED_ON_EMPTY applied");
+  })();
 }
 // const POPULAR_50 = [
 //   // ETFs & index/future
@@ -210,14 +254,17 @@ function normalizeIv(ivRaw) {
   return n <= 1.5 ? Math.round(n * 100) : Math.round(n);
 }
 
+// const DEFAULT_OPTIONS = (process.env.DEFAULT_OPTIONS || "").trim()
+//   ? JSON.parse(process.env.DEFAULT_OPTIONS)
+//   : [
+//       { underlying: "AAPL", expiration: "2025-12-19", strike: 200, right: "C" },
+//       { underlying: "NVDA", expiration: "2025-12-19", strike: 150, right: "P" },
+//     ];
+// const SEED_MARK = ".seeded";
 const DEFAULT_OPTIONS = (process.env.DEFAULT_OPTIONS || "").trim()
   ? JSON.parse(process.env.DEFAULT_OPTIONS)
-  : [
-      { underlying: "AAPL", expiration: "2025-12-19", strike: 200, right: "C" },
-      { underlying: "NVDA", expiration: "2025-12-19", strike: 150, right: "P" },
-    ];
-const SEED_MARK = ".seeded";
-
+  : []; // no demo seeds
+const SEED_MARK = ""; // disable any seed guard logic downstream
 
 /* ================= IB HELPERS (cached) ================= */
 const CONID_TTL_MS = 12*60*60*1000;
@@ -255,22 +302,51 @@ function wsBroadcast(topic, data) {
   if (!wsReady || !wss) { WS_QUEUE.push(payload); return; }
   for (const c of wss.clients) if (c.readyState === 1) c.send(payload);
 }
-
+const DEMO = String(process.env.DEMO || "").trim() === "1";
 async function seedWatchlist() {
-  const DEFAULT_EQUITIES = (process.env.DEFAULT_EQUITIES || "SPY,QQQ,IWM,AAPL,NVDA,MSFT,SPX,ES")
-    .split(",").map(s => s.trim().toUpperCase()).filter(Boolean);
-
-  for (const s of DEFAULT_EQUITIES) addEquity(s);
-  if (!(WATCH.options?.length)) {
-    addOptions([
-      { underlying: "AAPL", expiration: "2025-12-19", strike: 200, right: "C" },
-      { underlying: "NVDA", expiration: "2025-12-19", strike: 150, right: "P" },
-    ]);
-  }
-  wsBroadcast("watchlist", getWatchlist());
+  // Only seed in explicit DEMO mode
+  const envList = (process.env.DEFAULT_EQUITIES || "").trim();
+  const desired = (envList ? envList.split(",") : POPULAR_50)
+    .map(s => s.trim().toUpperCase())
+    .filter(Boolean);
+  for (const s of desired) await addEquity(s);
+  // Demo-only option legs (optional)
+  // if (!Array.isArray(WATCH.options) || WATCH.options.length === 0) {
+  //   await addOptions([
+  //     { underlying: "AAPL", expiration: "2025-12-19", strike: 200, right: "C" },
+  //     { underlying: "NVDA", expiration: "2025-12-19", strike: 150, right: "P" },
+  //   ]);
+  // }
+  // if (DEMO && (!Array.isArray(WATCH.options) || WATCH.options.length === 0)) {
+  //   await addOptions([
+  //     { underlying: "AAPL", expiration: "2025-12-19", strike: 200, right: "C" },
+  //     { underlying: "NVDA", expiration: "2025-12-19", strike: 150, right: "P" },
+  //   ]);
+  // }  
+  // wsBroadcast("watchlist", getWatchlist());
+  wsBroadcast("watchlist", makeWatchlistPayload());
 }
 
-seedWatchlist();
+// async function seedWatchlist() {
+//   // const DEFAULT_EQUITIES = (process.env.DEFAULT_EQUITIES || "SPY,QQQ,IWM,AAPL,NVDA,MSFT,SPX,ES")
+//   //   .split(",").map(s => s.trim().toUpperCase()).filter(Boolean);
+
+//   // for (const s of DEFAULT_EQUITIES) addEquity(s);
+//   const envList = (process.env.DEFAULT_EQUITIES || "").trim();
+//   const desired = (envList ? envList.split(",") : POPULAR_50)
+//     .map(s => s.trim().toUpperCase()).filter(Boolean);
+//   for (const s of desired) addEquity(s);
+
+//   if (!(WATCH.options?.length)) {
+//     addOptions([
+//       { underlying: "AAPL", expiration: "2025-12-19", strike: 200, right: "C" },
+//       { underlying: "NVDA", expiration: "2025-12-19", strike: 150, right: "P" },
+//     ]);
+//   }
+//   wsBroadcast("watchlist", getWatchlist());
+// }
+
+// seedWatchlist();
 
 
 const server = http.createServer(app);
@@ -298,13 +374,19 @@ for (const payload of WS_QUEUE.splice(0)) {
 // }
 
 // quick ul price fallback if quotes aren't ready yet
-const DEMO_BASE = { SPY: 510, QQQ: 430, IWM: 205, AAPL: 268, NVDA: 206, MSFT: 516 };
+// const DEMO_BASE = { SPY: 510, QQQ: 430, IWM: 205, AAPL: 268, NVDA: 206, MSFT: 516 };
 
 /** Get an underlying's price from STATE.quotes or a fallback */
+// function getULPrice(ul){
+//   const q = (STATE.quotes && STATE.quotes[ul]) || null;
+//   if (q && typeof q.last === "number" && q.last > 0) return q.last;
+//   return DEMO_BASE[ul] ?? 100;
+// }
+/** Get an underlying's price from STATE.quotes; no demo fallback */
 function getULPrice(ul){
   const q = (STATE.quotes && STATE.quotes[ul]) || null;
   if (q && typeof q.last === "number" && q.last > 0) return q.last;
-  return DEMO_BASE[ul] ?? 100;
+  return undefined; // callers must handle undefined
 }
 
 /** yyyy-mm-dd */
@@ -442,6 +524,12 @@ function synthesizeSweepsFrom(events, {
   sweeps.sort((a,b)=> b.ts - a.ts);
   return sweeps.slice(0, topN);
 }
+
+/* ================= HELPERS ================= */
+const sleep=(ms)=>new Promise(r=>setTimeout(r,ms));
+const clamp=(x,min,max)=>Math.max(min,Math.min(max,x));
+const uniq=(a)=>Array.from(new Set(a));
+
 /** Build a small options chain near the money for demo */
 function seedDemoOptionsFromULs(uls){
   const expiries = nextFridays(2);          // e.g., ['2025-11-07','2025-11-14']
@@ -471,30 +559,80 @@ function seedDemoOptionsFromULs(uls){
   return out;
 }
 // 1) Keep normalizePrint simple but let callers override qty/notional later
-function normalizePrint(t, kind = "SWEEP"){
-  const price = Number((t.last ?? t.bid ?? t.ask ?? 1).toFixed(2));
-  const qty   = 10; // base; will be overridden below
-  const notional = Number((price * 100 * qty).toFixed(2));
-  return {
-    kind: kind.toUpperCase(),           // "SWEEP" | "BLOCK"
-    ul: t.underlying || "UNKNOWN",
-    right: t.right === "C" ? "CALL" : "PUT",
-    strike: t.strike ?? 0,
-    expiry: t.expiration || "2099-12-31",
-    side: "BUY",
-    qty,
-    price,
-    notional,
-    prints: Math.floor(1 + Math.random()*3),
-    venue: "demo",
-    ts: Date.now()
-  };
+// function normalizePrint(t, kind = "SWEEP"){
+//   const price = Number((t.last ?? t.bid ?? t.ask ?? 1).toFixed(2));
+//   const qty   = 10; // base; will be overridden below
+//   const notional = Number((price * 100 * qty).toFixed(2));
+//   return {
+//     kind: kind.toUpperCase(),           // "SWEEP" | "BLOCK"
+//     ul: t.underlying || "UNKNOWN",
+//     right: t.right === "C" ? "CALL" : "PUT",
+//     strike: t.strike ?? 0,
+//     expiry: t.expiration || "2099-12-31",
+//     side: "BUY",
+//     qty,
+//     price,
+//     notional,
+//     prints: Math.floor(1 + Math.random()*3),
+//     venue: "demo",
+//     ts: Date.now()
+//   };
+// }
+function inferAggressor({ price, bid, ask }) {
+  if (typeof price !== "number") return "UNKNOWN";
+  if (typeof bid === "number" && price <= bid + 0.01) return "AT_BID";
+  if (typeof ask === "number" && price >= ask - 0.01) return "AT_ASK";
+  return "NEAR_MID";
 }
 
+/** Strictly normalize a real options trade/print; return null if insufficient */
+function normalizePrint(t, kind = "SWEEP") {
+  const ul      = t.underlying || t.ul;
+  const rightCh = (t.right || t.option_type || "").toString().toUpperCase();
+  const right   = rightCh === "C" || rightCh === "CALL" ? "CALL"
+                : rightCh === "P" || rightCh === "PUT"  ? "PUT" : undefined;
+  const strike  = Number(t.strike ?? t.strike_price);
+  const expiry  = (t.expiration || t.expiry || t.expiration_date || "").toString();
+  const price   = Number(t.price ?? t.last ?? t.executed_price ?? t.fill_price);
+  const qty     = Number(t.qty ?? t.size ?? t.quantity ?? t.trade_size);
+  const bid     = (t.bid ?? t.best_bid);
+  const ask     = (t.ask ?? t.best_ask);
+  const sideRaw = (t.side || t.liquidity || t.order_side || "").toString().toUpperCase();
+
+  if (!ul || !right || !isFinite(strike) || !expiry || !isFinite(price) || price <= 0 || !isFinite(qty) || qty <= 0) {
+    return null; // drop bad/partial data
+  }
+
+  // Derive side if missing using aggressor vs. bid/ask
+  let side = ["BUY","SELL"].includes(sideRaw) ? sideRaw
+           : (() => {
+               const ag = inferAggressor({ price, bid: Number(bid), ask: Number(ask) });
+               return ag === "AT_ASK" ? "BUY" : ag === "AT_BID" ? "SELL" : "UNKNOWN";
+             })();
+
+  const multiplier = Number(t.multiplier ?? 100);
+  const notional = Math.round(price * qty * multiplier);
+
+  return {
+    kind: String(kind || "").toUpperCase(), // "SWEEP" | "BLOCK" | "PRINT"
+    ul,
+    right,
+    strike,
+    expiry,
+    side,
+    qty,
+    price: Number(price.toFixed(2)),
+    notional,
+    prints: Number(t.prints ?? 1),
+    aggressor: inferAggressor({ price, bid: Number(bid), ask: Number(ask) }),
+    venue: t.venue || t.source || "live",
+    ts: Number(t.ts ?? t.timestamp ?? Date.now())
+  };
+}
 /* ========== INITIAL SEEDING ========== */
 
 // Ensure these are the symbols you already seeded
-const SEEDED_EQUITIES = ["SPY","QQQ","IWM","AAPL","NVDA","MSFT"];
+// const SEEDED_EQUITIES = ["SPY","QQQ","IWM","AAPL","NVDA","MSFT"];
 
 // Seed options once at startup (and you can call it again after quotes appear)
 // function seedDemoOptions(){
@@ -537,12 +675,25 @@ setInterval(() => {
 }, 1000);
 
 function seedDemoOptions(){
+  if (!DEMO) {
+    // In non-demo mode never seed. Make sure options_ts starts empty and real collectors fill it.
+    if (!Array.isArray(STATE.options_ts)) STATE.options_ts = [];
+    return;
+  }
   const wf = loadWatchlistFile();
   const uls = (wf?.equities ?? []).map(s => s.toUpperCase());
-  const opts = seedDemoOptionsFromULs(uls.length ? uls : DEFAULT_EQUITIES);
+  const opts = seedDemoOptionsFromULs(uls.length ? uls : (DEFAULT_EQUITIES || []));
   STATE.options_ts = opts;
-  console.log("Seeded demo options for", uls.length, "symbols");
+  console.log("Seeded DEMO options for", uls.length, "symbols");
 }
+
+// function seedDemoOptions(){
+//   const wf = loadWatchlistFile();
+//   const uls = (wf?.equities ?? []).map(s => s.toUpperCase());
+//   const opts = seedDemoOptionsFromULs(uls.length ? uls : DEFAULT_EQUITIES);
+//   STATE.options_ts = opts;
+//   console.log("Seeded demo options for", uls.length, "symbols");
+// }
 let lastHeadlinesJson = "";
 setInterval(() => {
   const headlines = computeHeadlines({ windowMs: ROLLING_MS, minNotional: 50_000, topN: 12 });
@@ -581,7 +732,8 @@ function symbolToConid(symbol){
   return CACHE.conidBySym.get(symbol)?.conid;
 }
 // Call once during boot
-seedDemoOptions();
+// seedDemoOptions();
+
 
 /* ========== DEMO TAPES (Sweeps/Blocks) ========== */
 
@@ -636,7 +788,17 @@ function makeDemoTapeFromOptions(optionsTicks, kind){
       p.notional = qty * p.price * 100;
 
       // lean buy-side to make it visible regardless of side filter
-      p.side = "BUY";
+      // p.side = "BUY";
+
+      // infer vs mid from NBBO if we have it; else UNKNOWN
+      const nbbo = NBBO_OPT.get(toOcc(p.ul || t.underlying, p.expiry || t.expiration, p.right === "CALL" ? "C" : "P", p.strike || t.strike));
+      if (nbbo && Number.isFinite(nbbo.bid) && Number.isFinite(nbbo.ask) && nbbo.bid > 0 && nbbo.ask > 0) {
+        const mid = (nbbo.bid + nbbo.ask) / 2;
+        const bps = ((p.price - mid) / mid) * 1e4;
+        p.side = bps >= TAPE_CFG.sweep.atAskBps ? "BUY" : (bps <= -TAPE_CFG.sweep.atAskBps ? "SELL" : "UNKNOWN");
+      } else {
+        p.side = "UNKNOWN";
+      }      
       p.venue = "demo";
       p.ts = Date.now();
 
@@ -645,8 +807,17 @@ function makeDemoTapeFromOptions(optionsTicks, kind){
       p.prints = 1;
       p.qty = Math.floor(250 + Math.random() * 750); // 250-1000 contracts
       p.price = Number((p.price || 1).toFixed(2));
-      p.notional = Math.max(150000, Math.round(p.qty * p.price * 100));
-      p.side = "BUY";
+      // p.notional = Math.max(150000, Math.round(p.qty * p.price * 100));
+      p.notional = Math.round(p.qty * p.price * 100);
+      // p.side = "BUY";
+      const nbboB = NBBO_OPT.get(toOcc(p.ul || t.underlying, p.expiry || t.expiration, p.right === "CALL" ? "C" : "P", p.strike || t.strike));
+      if (nbboB && Number.isFinite(nbboB.bid) && Number.isFinite(nbboB.ask) && nbboB.bid > 0 && nbboB.ask > 0) {
+        const mid = (nbboB.bid + nbboB.ask) / 2;
+        const bps = ((p.price - mid) / mid) * 1e4;
+        p.side = bps >= TAPE_CFG.sweep.atAskBps ? "BUY" : (bps <= -TAPE_CFG.sweep.atAskBps ? "SELL" : "UNKNOWN");
+      } else {
+        p.side = "UNKNOWN";
+      }      
       p.venue = "demo";
       p.ts = Date.now();
     }
@@ -692,10 +863,6 @@ async function pollBlocksOnce(){ try {
 //   for (const c of wss.clients) if (c.readyState === 1) c.send(payload);
 // }
 
-/* ================= HELPERS ================= */
-const sleep=(ms)=>new Promise(r=>setTimeout(r,ms));
-const clamp=(x,min,max)=>Math.max(min,Math.min(max,x));
-const uniq=(a)=>Array.from(new Set(a));
 // const isNonEmptyStr=(s)=>typeof s==="string" && s.trim().length>0;
 const num=(x)=> (x==null ? undefined : Number(x));
 
@@ -755,7 +922,8 @@ async function watchAddEquities(symbols = []) {
       await resolveFrontMonthES().catch(()=>{});
     }
   }
-  wsBroadcast("watchlist", getWatchlist());
+  // wsBroadcast("watchlist", getWatchlist());
+  wsBroadcast("watchlist", makeWatchlistPayload());
   return Array.from(WATCH.equities);
 }
 function fixEsSpxCollision(pairs){
@@ -896,12 +1064,12 @@ async function ibConidForSymbol(sym){
   if (cached?.conid && (Date.now() - (cached.ts || 0)) < CONID_TTL_MS) return cached.conid;
 
   // MOCK mode
-  if (MOCK){
-    const demo = { AAPL:"265598", NVDA:"4815747", MSFT:"272093", SPY:"756733", SPX:"416904", ES:"123456" };
-    const c = demo[key] || String(100000 + Math.floor(Math.random()*9e5));
-    CACHE.conidBySym.set(key, { conid:c, ts:Date.now() });
-    return c;
-  }
+  // if (MOCK){
+  //   const demo = { AAPL:"265598", NVDA:"4815747", MSFT:"272093", SPY:"756733", SPX:"416904", ES:"123456" };
+  //   const c = demo[key] || String(100000 + Math.floor(Math.random()*9e5));
+  //   CACHE.conidBySym.set(key, { conid:c, ts:Date.now() });
+  //   return c;
+  // }
 
   // Query IB
   let best = null;
@@ -933,7 +1101,7 @@ async function watchAddOptions(options=[]){
     if (o.underlying && o.right && Number.isFinite(o.strike)) WATCH.options.push(o);
   }
   const after = normOptions(WATCH).length;
-  if (after>before) wsBroadcast("watchlist", getWatchlist());
+  if (after>before) wsBroadcast("watchlist", makeWatchlistPayload());//wsBroadcast("watchlist", getWatchlist());
   return Math.max(0, after-before);
 }
 
@@ -1509,6 +1677,14 @@ async function pollEquitiesOnce(){
     console.warn("pollEquitiesOnce:", e.message);
   }
 }
+app.get('/insights/notables', (req, res) => {
+  try {
+    const cfg = Object.fromEntries(Object.entries(req.query).map(([k,v])=>[k, Number(v)]));
+    // const payload = buildNotables({ sweeps: memory.sweeps||[], blocks: memory.blocks||[] }, cfg);
+    const payload = buildNotables({ sweeps: STATE.sweeps || [], blocks: STATE.blocks || [] }, cfg);
+    res.json(payload);
+  } catch (e) { res.status(500).json({ error: e?.message||'fail' }); }
+});
 
 // GET /api/flow/blocks?minNotional=50000&limit=50
 app.get("/api/flow/blocks", (req,res)=>{
@@ -2218,7 +2394,8 @@ wss.on("connection", (ws) => {
   wsSend(ws, "options_ts", STATE.options_ts || []);
   wsSend(ws, "sweeps",    STATE.sweeps    || []);
   wsSend(ws, "blocks",    STATE.blocks    || []);
-  wsSend(ws, "watchlist", getWatchlist()); // <-- shared
+  // wsSend(ws, "watchlist", getWatchlist()); // <-- shared
+  wsSend(ws, "watchlist", makeWatchlistPayload());
   wsSend(ws, "headlines", computeHeadlines());   // <— add this
 });
 (async () => {
@@ -2338,30 +2515,69 @@ app.get("/health", (req,res)=>{
 
 async function seedDefaultsOnce() {
   try {
+//     if (fs.existsSync(SEED_MARK)) return;
+//     const curEq = new Set(normEquities(WATCH));
+//     const toAddEq = DEFAULT_EQUITIES.filter(s => !curEq.has(s));
+//     if (toAddEq.length) await watchAddEquities(toAddEq);
+
+//     const curOptsKey = new Set(normOptions(WATCH).map(o => `${o.underlying}:${o.expiration}:${o.strike}:${o.right}`));
+//     const toAddOpts = DEFAULT_OPTIONS.filter(o => {
+//       const k = `${String(o.underlying).toUpperCase()}:${o.expiration}:${o.strike}:${String(o.right).toUpperCase()[0]}`;
+//       return !curOptsKey.has(k);
+//     });
+//     if (toAddOpts.length) await watchAddOptions(toAddOpts);
+
+//     // kick first polls so UI has data immediately
+//     await pollEquitiesOnce();
+//     await pollOptionsOnce();
+//     wsBroadcast("watchlist", getWatchlist());
+//     if (STATE.equities_ts?.length) wsBroadcast("equity_ts", STATE.equities_ts);
+//     if (STATE.options_ts?.length)  wsBroadcast("options_ts", STATE.options_ts);
+
+//     fs.writeFileSync(SEED_MARK, new Date().toISOString());
+//     console.log(`[seed] equities=${JSON.stringify(toAddEq)} options=${toAddOpts.length}`);
+//   } catch (e) { console.warn("seedDefaultsOnce:", e.message); }
+// }
+    // Only seed once when either DEMO is on, or explicit SEED_ON_EMPTY is set AND the watchlist is empty.
+    const isEmpty = (WATCH.equities?.size || 0) === 0 && (WATCH.options?.length || 0) === 0;
     if (fs.existsSync(SEED_MARK)) return;
+    if (!(DEMO || (SEED_ON_EMPTY && isEmpty))) return;
+
     const curEq = new Set(normEquities(WATCH));
-    const toAddEq = DEFAULT_EQUITIES.filter(s => !curEq.has(s));
+    const envList = (process.env.DEFAULT_EQUITIES || "").trim();
+    const desiredEq = (envList ? envList.split(",") : POPULAR_50)
+      .map(s => s.trim().toUpperCase())
+      .filter(Boolean);
+    const toAddEq = desiredEq.filter(s => !curEq.has(s));
     if (toAddEq.length) await watchAddEquities(toAddEq);
 
-    const curOptsKey = new Set(normOptions(WATCH).map(o => `${o.underlying}:${o.expiration}:${o.strike}:${o.right}`));
-    const toAddOpts = DEFAULT_OPTIONS.filter(o => {
-      const k = `${String(o.underlying).toUpperCase()}:${o.expiration}:${o.strike}:${String(o.right).toUpperCase()[0]}`;
-      return !curOptsKey.has(k);
-    });
-    if (toAddOpts.length) await watchAddOptions(toAddOpts);
+    // Only add default options in DEMO
+    let toAddOpts = [];
+    if (DEMO) {
+      const curOptsKey = new Set(
+        normOptions(WATCH).map(o => `${o.underlying}:${o.expiration}:${o.strike}:${o.right}`)
+      );
+      toAddOpts = DEFAULT_OPTIONS.filter(o => {
+        const k = `${String(o.underlying).toUpperCase()}:${o.expiration}:${o.strike}:${String(o.right).toUpperCase()[0]}`;
+        return !curOptsKey.has(k);
+      });
+      if (toAddOpts.length) await watchAddOptions(toAddOpts);
+    }
 
-    // kick first polls so UI has data immediately
-    await pollEquitiesOnce();
-    await pollOptionsOnce();
-    wsBroadcast("watchlist", getWatchlist());
-    if (STATE.equities_ts?.length) wsBroadcast("equity_ts", STATE.equities_ts);
-    if (STATE.options_ts?.length)  wsBroadcast("options_ts", STATE.options_ts);
+    // Kick first polls ONLY if we actually added something
+    if (toAddEq.length) await pollEquitiesOnce();
+    if (toAddOpts.length) await pollOptionsOnce();
+
+    // wsBroadcast("watchlist", getWatchlist());
+    wsBroadcast("watchlist", makeWatchlistPayload());
+    if (Array.isArray(STATE.equities_ts) && STATE.equities_ts.length) wsBroadcast("equity_ts", STATE.equities_ts);
+    if (Array.isArray(STATE.options_ts)  && STATE.options_ts.length)  wsBroadcast("options_ts",  STATE.options_ts);
 
     fs.writeFileSync(SEED_MARK, new Date().toISOString());
-    console.log(`[seed] equities=${JSON.stringify(toAddEq)} options=${toAddOpts.length}`);
-  } catch (e) { console.warn("seedDefaultsOnce:", e.message); }
-}
-
+    console.log(`[seed] mode=${DEMO ? "DEMO" : "SEED_ON_EMPTY"} equities=${toAddEq.length} options=${toAddOpts.length}`);
+   } catch (e) { console.warn("seedDefaultsOnce:", e.message); }
+ }
+ 
 server.listen(PORT, async () => {
   console.log(`Listening on http://localhost:${PORT}`);
   await seedDefaultsOnce();
