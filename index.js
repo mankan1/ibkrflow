@@ -14,6 +14,11 @@ import { WebSocketServer } from "ws";
 import fs from "fs";
 
 import { router as watchlistRouter } from "./routes/watchlist.js";
+import {
+  WATCH, getWatchlist, addEquity, addOptions, normalizeSymbol,
+  setBroadcaster, broadcastWatchlist
+} from "./state.js";
+
 
 const ALIASES = new Map([
   ["$SPX", "SPX"],
@@ -21,10 +26,10 @@ const ALIASES = new Map([
   ["/ES", "ES"],
   ["ES1!", "ES"],   // TradingView style
 ]);
-function canon(sym) {
-  const s = String(sym||"").trim().toUpperCase();
-  return ALIASES.get(s) || s;
-}
+// function canon(sym) {
+//   const s = String(sym||"").trim().toUpperCase();
+//   return ALIASES.get(s) || s;
+// }
 
 /* ================= CONFIG ================= */
 const PORT    = Number(process.env.PORT || 8080);
@@ -32,10 +37,10 @@ const IB_BASE = String(process.env.IB_BASE || "https://127.0.0.1:5000/v1/api").r
 const MOCK    = String(process.env.MOCK || "") === "1";
 
 /* ================= STATE ================= */
-const WATCH = {
-  equities: new Set(),                 // "AAPL","NVDA","MSFT"
-  options: [],                         // {underlying, expiration(YYYY-MM-DD), strike, right(C|P)}
-};
+// const WATCH = {
+//   equities: new Set(),                 // "AAPL","NVDA","MSFT"
+//   options: [],                         // {underlying, expiration(YYYY-MM-DD), strike, right(C|P)}
+// };
 const STATE = {
   equities_ts: [],                     // [{symbol,last,bid,ask,iv?,ts}]
   options_ts:  [],                     // [{underlying,expiration,strike,right,last,bid,ask,ts}]
@@ -56,6 +61,9 @@ console.log(`HTTP+WS @ :${PORT}  MOCK=${MOCK?"on":"off"}  IB=${IB_BASE}`);
 
 /* ================= APP/WS ================= */
 const app = express();
+
+const FUT_ALIASES = new Map([["/ES","ES"], ["ES","ES"]]);
+
 /* ================= WATCHLIST STATE ================= */
 // const DEFAULT_EQUITIES = (process.env.DEFAULT_EQUITIES || "AAPL,MSFT,NVDA").split(",").map(s=>s.trim()).filter(Boolean);
 
@@ -123,8 +131,33 @@ if (!global.STATE) global.STATE = {};
 if (!STATE.watchlist) STATE.watchlist = { equities: [], options: [] };
 
 /* ================= SEED & START ================= */
-const DEFAULT_EQUITIES = (process.env.DEFAULT_EQUITIES || "AAPL,NVDA,MSFT,SPY").split(",")
-  .map(s => s.trim().toUpperCase()).filter(Boolean);
+// const DEFAULT_EQUITIES = (process.env.DEFAULT_EQUITIES || "AAPL,NVDA,MSFT,SPY").split(",")
+//   .map(s => s.trim().toUpperCase()).filter(Boolean);
+
+// const DEFAULT_EQUITIES = (process.env.DEFAULT_EQUITIES || "SPY,QQQ,IWM,AAPL,NVDA,MSFT,SPX,ES");
+// const DEFAULT_EQUITIES = (process.env.DEFAULT_EQUITIES || "SPY,QQQ,IWM,AAPL,NVDA,MSFT,SPX,ES")
+//   .split(",")
+//   .map(s => s.trim().toUpperCase())
+//   .filter(Boolean);
+
+const DEFAULT_EQUITIES = (process.env.DEFAULT_EQUITIES || "SPY,QQQ,IWM,AAPL,NVDA,MSFT,SPX,ES")
+  .split(",")
+  .map(s => s.trim().toUpperCase())
+  .filter(Boolean);
+
+function toNumStrict(x) {
+  if (typeof x === "number" && Number.isFinite(x)) return x;
+  if (x == null) return null;
+  const m = String(x).replace(/,/g, "").match(/-?\d+(\.\d+)?/);
+  return m ? Number(m[0]) : null;
+}
+function normalizeIv(ivRaw) {
+  const n = toNumStrict(ivRaw);
+  if (n == null) return null;
+  // handle 0.12 vs 12 — normalize to 0–100 scale
+  return n <= 1.5 ? Math.round(n * 100) : Math.round(n);
+}
+
 const DEFAULT_OPTIONS = (process.env.DEFAULT_OPTIONS || "").trim()
   ? JSON.parse(process.env.DEFAULT_OPTIONS)
   : [
@@ -168,9 +201,16 @@ function wsBroadcast(topic, data) {
 }
 
 async function seedWatchlist() {
-  await watchAddEquities(DEFAULT_EQUITIES);
-  WATCH.options = Array.isArray(WATCH.options) ? WATCH.options : [];
-  if (!WATCH.options.length) WATCH.options = DEFAULT_OPTIONS.slice();
+  const DEFAULT_EQUITIES = (process.env.DEFAULT_EQUITIES || "SPY,QQQ,IWM,AAPL,NVDA,MSFT,SPX,ES")
+    .split(",").map(s => s.trim().toUpperCase()).filter(Boolean);
+
+  for (const s of DEFAULT_EQUITIES) addEquity(s);
+  if (!(WATCH.options?.length)) {
+    addOptions([
+      { underlying: "AAPL", expiration: "2025-12-19", strike: 200, right: "C" },
+      { underlying: "NVDA", expiration: "2025-12-19", strike: 150, right: "P" },
+    ]);
+  }
   wsBroadcast("watchlist", getWatchlist());
 }
 
@@ -187,6 +227,7 @@ const server = http.createServer(app);
 // ---- Create WS server, then mark ready and flush any queued broadcasts ----
 wss = new WebSocketServer({ server, perMessageDeflate: false });
 wsReady = true;
+setBroadcaster(wsBroadcast);
 
 // Flush anything that tried to broadcast before WS stood up
 for (const payload of WS_QUEUE.splice(0)) {
@@ -301,7 +342,36 @@ function seedDemoOptions(){
     `(+${Math.max(0, opts.length-4)} more)`
   );
 }
+let FUT_FRONT = new Map(); // "ES" -> { symbol:"ESZ5", conid: 12345, display:"ESZ5" }
 
+async function resolveFrontMonth(symbol){ // symbol like "ES"
+  try {
+    // 1) Ask IB for futures chain (you already have IB_BASE + auth)
+    const fut = await ibFetch(`/trsrv/futures?symbols=${encodeURIComponent(symbol)}`);
+    // 2) Pick a front/active contract (pseudo-logic, adapt to your payload)
+    const chain = fut?.[symbol]?.contracts || [];
+    const active = chain.find(c => c.is_tradable && (c.is_front || c.is_active)) || chain[0];
+    if (active?.conid && active?.symbol) {
+      FUT_FRONT.set(symbol, { symbol: active.local_symbol || active.symbol, conid: String(active.conid), display: active.local_symbol || active.symbol });
+      console.log(`[FUT] ${symbol} -> ${active.local_symbol || active.symbol} (${active.conid})`);
+      return FUT_FRONT.get(symbol);
+    }
+  } catch(e){ console.warn("resolveFrontMonth:", e.message); }
+  return null;
+}
+
+// on boot (and maybe every few hours)
+await resolveFrontMonth("ES");
+
+// when snapshotting:
+function symbolToConid(symbol){
+  if (symbol === "/ES" || symbol === "ES"){
+    const r = FUT_FRONT.get("ES");
+    if (r?.conid) return r.conid;
+  }
+  // fall back to your existing conid cache for equities/indices
+  return CACHE.conidBySym.get(symbol)?.conid;
+}
 // Call once during boot
 seedDemoOptions();
 
@@ -418,7 +488,7 @@ async function pollBlocksOnce(){ try {
 const sleep=(ms)=>new Promise(r=>setTimeout(r,ms));
 const clamp=(x,min,max)=>Math.max(min,Math.min(max,x));
 const uniq=(a)=>Array.from(new Set(a));
-const isNonEmptyStr=(s)=>typeof s==="string" && s.trim().length>0;
+// const isNonEmptyStr=(s)=>typeof s==="string" && s.trim().length>0;
 const num=(x)=> (x==null ? undefined : Number(x));
 
 function rightNormalize(x){
@@ -444,7 +514,7 @@ function normOptions(W){
     right:rightNormalize(o?.right),
   })).filter(o=>o.underlying && o.right && Number.isFinite(o.strike));
 }
-function getWatchlist(){ return { equities: normEquities(WATCH), options: normOptions(WATCH) }; }
+// function getWatchlist(){ return { equities: normEquities(WATCH), options: normOptions(WATCH) }; }
 // async function watchAddEquities(eqs=[]){
 //   const before = normEquities(WATCH).length;
 //   for (const s of eqs) { const u=String(s).toUpperCase(); if (u) WATCH.equities.add(u); }
@@ -452,67 +522,196 @@ function getWatchlist(){ return { equities: normEquities(WATCH), options: normOp
 //   if (after>before) wsBroadcast("watchlist", getWatchlist());
 //   return Math.max(0, after-before);
 // }
-async function watchAddEquities(eqs=[]){
-  const before = normEquities(WATCH).length;
-  for (const s of eqs) { const u = canon(s); if (u) WATCH.equities.add(u); }
-  const after = normEquities(WATCH).length;
-  if (after>before) wsBroadcast("watchlist", getWatchlist());
-  return Math.max(0, after-before);
+// async function watchAddEquities(eqs=[]){
+//   const before = normEquities(WATCH).length;
+//   for (const s of eqs) { const u = canon(s); if (u) WATCH.equities.add(u); }
+//   const after = normEquities(WATCH).length;
+//   if (after>before) wsBroadcast("watchlist", getWatchlist());
+//   return Math.max(0, after-before);
+// }
+// async function watchAddEquities(symbols=[]) {
+//   for (const raw of symbols) {
+//     const sym = normalizeSymbol(raw);
+//     WATCH.equities.add(sym);          // keep "ES" (not "/ES"), keep "SPX"
+//   }
+//   wsBroadcast("watchlist", getWatchlist());
+//   return Array.from(WATCH.equities);
+// }
+async function watchAddEquities(symbols = []) {
+  for (const raw of symbols) {
+    const sym = normalizeSymbol(raw);   // "/ES" -> "ES"
+    WATCH.equities.add(sym);
+    if (sym === "ES") {
+      FUT_FRONT.delete("ES");
+      CACHE.conidBySym.delete("ES");
+      await resolveFrontMonthES().catch(()=>{});
+    }
+  }
+  wsBroadcast("watchlist", getWatchlist());
+  return Array.from(WATCH.equities);
 }
+function fixEsSpxCollision(pairs){
+  const es = pairs.find(p => p.sym === "ES");
+  const spx = pairs.find(p => p.sym === "SPX");
+  if (es && spx && String(es.conid) === String(spx.conid)) {
+    // bad: ES got the SPX index conid; fix & re-push ES
+    CACHE.conidBySym.delete("ES");
+    FUT_FRONT.delete("ES");
+  }
+}
+// async function ibConidForSymbol(sym){
+//   if (!isNonEmptyStr(sym)) return null;
+//   const key = canon(sym);
+
+//   // cache hit?
+//   const cached = CACHE.conidBySym.get(key);
+//   if (cached && cached.ts && (Date.now()-cached.ts) < CONID_TTL_MS) return cached.conid;
+
+//   // MOCK mode quick map
+//   if (MOCK){
+//     const demo = { AAPL:"265598", NVDA:"4815747", MSFT:"272093", SPY:"756733", SPX:"416904", ES:"123456" };
+//     const c = demo[key] || String(100000+Math.floor(Math.random()*9e5));
+//     CACHE.conidBySym.set(key, { conid:c, ts:Date.now() });
+//     return c;
+//   }
+
+//   // search once
+//   let best = null;
+//   try {
+//     const body = await ibFetch(`/iserver/secdef/search?symbol=${encodeURIComponent(key)}`);
+//     const list = Array.isArray(body) ? body : (body ? [body] : []);
+
+//     // prefer STK, then IND, then FUT
+//     const pick = (secType) =>
+//       list.find(r => String(r?.symbol||"").toUpperCase()===key &&
+//                      (r?.sections||[]).some(s=>s?.secType===secType) && r?.conid);
+
+//     best = pick("STK") || pick("IND") || pick("FUT") || list.find(r => r?.conid);
+//   } catch {}
+
+//   // FUT (ES): choose a front contract if choices exist
+//   if (best && (best.sections||[]).some(s=>s.secType==="FUT")) {
+//     // some responses include Contracts array; pick nearest expiry
+//     try {
+//       const info = await ibFetch(`/iserver/secdef/info?conid=${best.conid}`);
+//       const contracts = info?.Contracts || info || [];
+//       if (Array.isArray(contracts) && contracts.length) {
+//         const now = Date.now();
+//         contracts.sort((a,b)=>{
+//           const ta = Date.parse(a?.expiry || a?.maturity || "2100-01-01");
+//           const tb = Date.parse(b?.expiry || b?.maturity || "2100-01-01");
+//           return Math.abs(ta-now) - Math.abs(tb-now);
+//         });
+//         const fut = contracts.find(c=>c?.conid) || contracts[0];
+//         if (fut?.conid) best = { ...best, conid: String(fut.conid) };
+//       }
+//     } catch {}
+//   }
+
+//   const conid = best?.conid ? String(best.conid) : null;
+//   if (conid) CACHE.conidBySym.set(key, { conid, ts:Date.now() });
+//   return conid;
+// }
+// --- helpers & config (place near your other consts) ---
+// const CONID_TTL_MS = 24 * 60 * 60 * 1000;
+// const FUT_ALIASES = new Map([["/ES","ES"]]);
+
+function isNonEmptyStr(s){ return typeof s === "string" && s.trim().length > 0; }
+function canon(s){ return (FUT_ALIASES.get(String(s).trim().toUpperCase()) || String(s).trim().toUpperCase()); }
+
+// Prefer by secType, but allow a symbol-specific override
+function pickBestBySecType(list, key){
+  if (!Array.isArray(list) || !list.length) return null;
+
+  const hasType = (r, t) => (r?.sections || []).some(s => s?.secType === t);
+  const symEq   = (r) => String(r?.symbol || "").toUpperCase() === key;
+
+  // SPX: prefer IND
+  if (key === "SPX") {
+    const ind = list.find(r => symEq(r) && hasType(r, "IND") && r?.conid);
+    if (ind) return ind;
+  }
+
+  // ES: prefer FUT root hit
+  if (key === "ES") {
+    const fut = list.find(r => symEq(r) && hasType(r, "FUT") && r?.conid);
+    if (fut) return fut;
+  }
+
+  // General preference: STK -> IND -> FUT -> anything with a conid
+  return (
+    list.find(r => symEq(r) && hasType(r, "STK") && r?.conid) ||
+    list.find(r => symEq(r) && hasType(r, "IND") && r?.conid) ||
+    list.find(r => symEq(r) && hasType(r, "FUT") && r?.conid) ||
+    list.find(r => r?.conid)
+  );
+}
+
+// For FUT roots (ES), choose the nearest-dated actual contract
+async function chooseFrontMonth(conidMaybeRoot){
+  try{
+    const info = await ibFetch(`/iserver/secdef/info?conid=${encodeURIComponent(conidMaybeRoot)}`);
+    const contracts = Array.isArray(info?.Contracts) ? info.Contracts : (Array.isArray(info) ? info : []);
+    if (!contracts.length) return String(conidMaybeRoot);
+
+    const now = Date.now();
+    // parse any of expiry|maturity|lastTradingDay; fall back way out if missing
+    const getTs = (c) => {
+      const d = c?.expiry || c?.maturity || c?.lastTradingDay || "2100-01-01";
+      const t = Date.parse(d); 
+      return Number.isFinite(t) ? t : Date.parse("2100-01-01");
+    };
+
+    // prefer nearest future >= now; else the closest overall
+    const future = contracts
+      .map(c => ({ c, ts: getTs(c) }))
+      .filter(x => x.ts >= now)
+      .sort((a,b) => a.ts - b.ts)[0];
+
+    const best = future || contracts
+      .map(c => ({ c, ts: getTs(c) }))
+      .sort((a,b) => Math.abs(a.ts - now) - Math.abs(b.ts - now))[0];
+
+    return String(best?.c?.conid || conidMaybeRoot);
+  }catch{
+    return String(conidMaybeRoot);
+  }
+}
+
+// --- DROP-IN: ibConidForSymbol ---
 async function ibConidForSymbol(sym){
   if (!isNonEmptyStr(sym)) return null;
-  const key = canon(sym);
+  const key = canon(sym); // "/ES" -> "ES", uppercased
 
   // cache hit?
   const cached = CACHE.conidBySym.get(key);
-  if (cached && cached.ts && (Date.now()-cached.ts) < CONID_TTL_MS) return cached.conid;
+  if (cached?.conid && (Date.now() - (cached.ts || 0)) < CONID_TTL_MS) return cached.conid;
 
-  // MOCK mode quick map
+  // MOCK mode
   if (MOCK){
     const demo = { AAPL:"265598", NVDA:"4815747", MSFT:"272093", SPY:"756733", SPX:"416904", ES:"123456" };
-    const c = demo[key] || String(100000+Math.floor(Math.random()*9e5));
+    const c = demo[key] || String(100000 + Math.floor(Math.random()*9e5));
     CACHE.conidBySym.set(key, { conid:c, ts:Date.now() });
     return c;
   }
 
-  // search once
+  // Query IB
   let best = null;
-  try {
+  try{
     const body = await ibFetch(`/iserver/secdef/search?symbol=${encodeURIComponent(key)}`);
     const list = Array.isArray(body) ? body : (body ? [body] : []);
+    best = pickBestBySecType(list, key);
+  }catch{ /* ignore */ }
 
-    // prefer STK, then IND, then FUT
-    const pick = (secType) =>
-      list.find(r => String(r?.symbol||"").toUpperCase()===key &&
-                     (r?.sections||[]).some(s=>s?.secType===secType) && r?.conid);
-
-    best = pick("STK") || pick("IND") || pick("FUT") || list.find(r => r?.conid);
-  } catch {}
-
-  // FUT (ES): choose a front contract if choices exist
-  if (best && (best.sections||[]).some(s=>s.secType==="FUT")) {
-    // some responses include Contracts array; pick nearest expiry
-    try {
-      const info = await ibFetch(`/iserver/secdef/info?conid=${best.conid}`);
-      const contracts = info?.Contracts || info || [];
-      if (Array.isArray(contracts) && contracts.length) {
-        const now = Date.now();
-        contracts.sort((a,b)=>{
-          const ta = Date.parse(a?.expiry || a?.maturity || "2100-01-01");
-          const tb = Date.parse(b?.expiry || b?.maturity || "2100-01-01");
-          return Math.abs(ta-now) - Math.abs(tb-now);
-        });
-        const fut = contracts.find(c=>c?.conid) || contracts[0];
-        if (fut?.conid) best = { ...best, conid: String(fut.conid) };
-      }
-    } catch {}
+  // If FUT root (ES), translate root to actual front-month contract
+  if (best && (best.sections||[]).some(s => s.secType === "FUT")) {
+    best = { ...best, conid: await chooseFrontMonth(best.conid) };
   }
 
   const conid = best?.conid ? String(best.conid) : null;
-  if (conid) CACHE.conidBySym.set(key, { conid, ts:Date.now() });
+  if (conid) CACHE.conidBySym.set(key, { conid, ts: Date.now() });
   return conid;
 }
-
 async function watchAddOptions(options=[]){
   if (!Array.isArray(WATCH.options)) WATCH.options=[];
   const before = normOptions(WATCH).length;
@@ -718,13 +917,47 @@ async function ibOptMonthsForSymbol(sym){
 // }
 
 /* ================= MAPPERS ================= */
-function mapEquitySnapshot(sym, s){
-  return { symbol:sym, last:num(s["31"]), bid:num(s["84"]), ask:num(s["86"]), iv:num(s["7059"]), ts:Date.now() };
-}
-function mapOptionTick(ul, expiration, strike, right, s0){
-  return { underlying:ul, expiration, strike, right, last:num(s0["31"]), bid:num(s0["84"]), ask:num(s0["86"]), ts:Date.now() };
+// function mapEquitySnapshot(sym, s){
+//   return { symbol:sym, last:num(s["31"]), bid:num(s["84"]), ask:num(s["86"]), iv:num(s["7059"]), ts:Date.now() };
+// }
+// function mapEquitySnapshot(sym, s){
+//   const last = s['31'] ?? null;
+//   const bid  = s['84'] ?? null;
+//   const ask  = s['86'] ?? null;
+//   const iv   = s['7059'] ?? null; // can be null for SPX
+//   return { symbol: sym, last, bid, ask, iv, ts: Date.now() };
+// }
+
+// function mapOptionTick(ul, expiration, strike, right, s0){
+//   return { underlying:ul, expiration, strike, right, last:num(s0["31"]), bid:num(s0["84"]), ask:num(s0["86"]), ts:Date.now() };
+// }
+function mapEquitySnapshot(sym, s) {
+  const last = toNumStrict(s["31"]);
+  const bid  = toNumStrict(s["84"]);
+  const ask  = toNumStrict(s["86"]);
+  const iv   = normalizeIv(s["7059"]);        // may be null (e.g., SPX)
+  return {
+    symbol: sym,
+    last: last ?? null,
+    bid:  bid ?? null,
+    ask:  ask ?? null,
+    iv:   iv ?? null,
+    ts: Date.now()
+  };
 }
 
+function mapOptionTick(ul, expiration, strike, right, s0) {
+  return {
+    underlying: ul,
+    expiration,
+    strike: Number(strike),
+    right,
+    last: toNumStrict(s0["31"]),
+    bid:  toNumStrict(s0["84"]),
+    ask:  toNumStrict(s0["86"]),
+    ts: Date.now()
+  };
+}
 /* ================= POLLERS ================= */
 async function ibFetchJson(url, init){
   const r = await fetch(url, init);
@@ -733,33 +966,483 @@ async function ibFetchJson(url, init){
 }
 if (typeof fetch === "undefined") { global.fetch = (await import("node-fetch")).default; }
 
+// Resolve ES front-month once in a while (10 min TTL)
+async function resolveFrontMonthES(){
+  const cur = FUT_FRONT.get("ES");
+  if (cur && Date.now() - (cur.ts || 0) < 10 * 60 * 1000) return cur;
+
+  // Try both "ES" and "/ES" depending on your IB resolver
+  const conid =
+    await ibConidForSymbol("ES").catch(()=>null) ||
+    await ibConidForSymbol("/ES").catch(()=>null);
+
+  if (conid){
+    const rec = { conid: String(conid), ts: Date.now() };
+    FUT_FRONT.set("ES", rec);
+    return rec;
+  }
+  return null;
+}
+
+// Memoizing conid fetch for equities/indices (24h TTL)
+// async function ensureConid(symbol){
+//   const key = (symbol || "").toUpperCase();
+//   const cached = CACHE.conidBySym.get(key);
+//   if (cached?.conid && Date.now() - (cached.ts || 0) < 24 * 60 * 60 * 1000) {
+//     return cached.conid;
+//   }
+//   const conid = await ibConidForSymbol(key).catch(()=>null);
+//   if (conid){
+//     CACHE.conidBySym.set(key, { conid: String(conid), ts: Date.now() });
+//   }
+//   return conid;
+// }
+async function ensureConid(symbol){
+  const key = (symbol || "").toUpperCase();
+
+  if (key === "ES") {
+    // always use front-month resolver; never reuse an equity/IND conid
+    const r = await resolveFrontMonthES().catch(()=>null);
+    return r?.conid || null;
+  }
+
+  const cached = CACHE.conidBySym.get(key);
+  if (cached?.conid && Date.now() - (cached.ts || 0) < 24 * 60 * 60 * 1000) {
+    return cached.conid;
+  }
+  const conid = await ibConidForSymbol(key).catch(()=>null);
+  if (conid){
+    CACHE.conidBySym.set(key, { conid: String(conid), ts: Date.now() });
+  }
+  return conid;
+}
+// async function ensureConid(symbol){
+//   const key = (symbol || "").toUpperCase();
+
+//   // SPECIAL: ES uses front-month resolver
+//   if (key === "ES") {
+//     const r = await resolveFrontMonthES().catch(()=>null);
+//     return r?.conid || null;
+//   }
+
+//   // memoized for everything else
+//   const cached = CACHE.conidBySym.get(key);
+//   if (cached?.conid && Date.now() - (cached.ts || 0) < 24 * 60 * 60 * 1000) {
+//     return cached.conid;
+//   }
+//   const conid = await ibConidForSymbol(key).catch(()=>null);
+//   if (conid){
+//     CACHE.conidBySym.set(key, { conid: String(conid), ts: Date.now() });
+//   }
+//   return conid;
+// }
+
+// async function ensureConid(symbol){
+//   const key = (symbol || "").toUpperCase();
+//   if (key === "ES") {
+//     const r = await resolveFrontMonthES();
+//     return r?.conid || null;
+//   }
+//   const cached = CACHE.conidBySym.get(key);
+//   if (cached?.conid && Date.now() - (cached.ts || 0) < 24*60*60*1000) return cached.conid;
+//   const conid = await ibConidForSymbol(key).catch(()=>null);
+//   if (conid) CACHE.conidBySym.set(key, { conid: String(conid), ts: Date.now() });
+//   return conid;
+// }
+
+// function normalizeSymbol(s) {
+//   const up = String(s || "").trim().toUpperCase();
+//   return FUT_ALIASES.get(up) || up;   // "/ES" -> "ES"
+// }
+// ===== CONID resolution for indices & futures =====
+// const FUT_FRONT = new Map(); // ES -> { conid, ts }
+
+// function symbolToConid(symbol){
+//   const s = (symbol||"").toUpperCase();
+//   if (s === "ES") {
+//     const r = FUT_FRONT.get("ES");
+//     if (r?.conid) return r.conid; // front month
+//   }
+//   return CACHE.conidBySym.get(s)?.conid || null;
+// }
+
+// async function resolveFrontMonthES(){
+//   const cur = FUT_FRONT.get("ES");
+//   if (cur && Date.now() - (cur.ts||0) < 10*60*1000) return cur; // 10 min TTL
+
+//   // Your existing IB symbol lookup; try both variants
+//   const conid =
+//     await ibConidForSymbol("ES").catch(()=>null) ||
+//     await ibConidForSymbol("/ES").catch(()=>null);
+//   if (conid){
+//     const rec = { conid:String(conid), ts:Date.now() };
+//     FUT_FRONT.set("ES", rec);
+//     return rec;
+//   }
+//   return null;
+// }
+
+// async function ensureConid(symbol){
+//   const key = (symbol||"").toUpperCase();
+//   // ES handled by resolveFrontMonthES
+//   if (key === "ES") {
+//     const r = await resolveFrontMonthES();
+//     return r?.conid || null;
+//   }
+//   const cached = CACHE.conidBySym.get(key);
+//   if (cached?.conid && Date.now() - (cached.ts||0) < 24*60*60*1000) return cached.conid;
+
+//   const conid = await ibConidForSymbol(key).catch(()=>null);
+//   if (conid) CACHE.conidBySym.set(key, { conid:String(conid), ts:Date.now() });
+//   return conid;
+// }
+
+// async function pollEquitiesOnce(){
+//   try {
+//     const symbols = (normEquities?.(WATCH) || []).map(s => (s || "").toUpperCase());
+//     if (!symbols.length) return;
+
+//     // 1) Make sure ES front-month is resolved once before polling, if we need it
+//     if (symbols.some(s => s === "/ES" || s === "ES")) {
+//       const esConid = symbolToConid("ES");
+//       if (!esConid) await resolveFrontMonthES().catch(()=>{});
+//     }
+
+//     // 2) Build symbol↔conid pairs using symbolToConid, falling back to ensureConid()
+//     const pairs = [];
+//     for (const sym of symbols){
+//       let conid = symbolToConid(sym);
+//       if (!conid) {
+//         // equities/indices: try normal resolver
+//         if (sym !== "/ES" && sym !== "ES") {
+//           conid = await ensureConid(sym).catch(()=>null);
+//         } else {
+//           // futures: re-resolve front month if needed
+//           await resolveFrontMonthES().catch(()=>{});
+//           conid = symbolToConid(sym);
+//         }
+//       }
+//       if (conid) pairs.push({ sym: sym === "/ES" ? "ES" : sym, conid: String(conid) });
+//     }
+//     if (!pairs.length) {
+//       // Push placeholders so UI shows the symbols even if unresolved this tick
+//       const placeholders = symbols.map(sym => ({ symbol: sym, last: null, ts: Date.now() }));
+//       STATE.equities_ts = placeholders;
+//       wsBroadcast("equity_ts", placeholders);
+//       return;
+//     }
+
+//     // 3) Fetch snapshots (or mock)
+//     let rows = [];
+//     if (MOCK) {
+//       // simple mock: give something stable-ish per symbol
+//       for (const p of pairs) {
+//         const base = { SPY: 679, QQQ: 627, IWM: 244, AAPL: 267, NVDA: 205, MSFT: 514, SPX: 5600, ES: 5600 };
+//         const last = (base[p.sym] ?? 100) + Math.random()*0.5 - 0.25;
+//         rows.push({ symbol: p.sym, last: Number(last.toFixed(2)), bid: last-0.1, ask: last+0.1, iv: 40, ts: Date.now() });
+//       }
+//     } else {
+//       const conids = pairs.map(p => p.conid).join(",");
+//       // fields: 31=last, 84=bid, 86=ask, 7059=iv (or whatever your mapper expects)
+//       const snaps = await ibFetch(`/iserver/marketdata/snapshot?conids=${encodeURIComponent(conids)}&fields=31,84,86,7059`);
+//       for (const p of pairs) {
+//         const s = Array.isArray(snaps) ? snaps.find(z => String(z.conid) === String(p.conid)) : null;
+//         if (!s) {
+//           rows.push({ symbol: p.sym, last: null, ts: Date.now() });
+//           continue;
+//         }
+//         rows.push(mapEquitySnapshot(p.sym, s));
+//       }
+//     }
+
+//     // 4) Preserve order as `symbols`, and ensure any missing symbols get placeholders
+//     const bySym = new Map(rows.map(r => [r.symbol, r]));
+//     const ordered = symbols.map(sym => bySym.get(sym === "/ES" ? "ES" : sym) || { symbol: sym, last: null, ts: Date.now() });
+
+//     STATE.equities_ts = ordered;
+//     wsBroadcast("equity_ts", ordered);
+//   } catch (e) {
+//     console.warn("pollEquitiesOnce:", e?.message || e);
+//   }
+// }
+// async function pollEquitiesOnce(){
+//   try{
+//     // 1) normalize current watchlist
+//     const symbols = Array.from(WATCH.equities || []).map(normalizeSymbol);
+//     if (!symbols.length) return;
+
+//     // 2) get conids (memoized) — ES via resolveFrontMonth
+//     const pairs = [];
+//     for (const sym of symbols){
+//       try{
+//         const conid = await ensureConid(sym);
+//         if (conid) pairs.push({ sym, conid });
+//       }catch{}
+//     }
+//     if (!pairs.length) return;
+
+//     // 3) fetch IB snapshot
+//     let rows=[];
+//     if (MOCK){
+//       rows = pairs.map(p => ({
+//         symbol: p.sym,
+//         last: 100 + Math.random()*50,
+//         bid: 0, ask: 0, iv: p.sym==="MSFT" ? 0.40 : 1.00,
+//         ts: Date.now()
+//       }));
+//     }else{
+//       const conids = pairs.map(p=>p.conid).join(",");
+//       // 31: last, 84: bid, 86: ask, 7059: implied vol (may be missing for index)
+//       const snaps  = await ibFetch(`/iserver/marketdata/snapshot?conids=${encodeURIComponent(conids)}&fields=31,84,86,7059`);
+//       for (const p of pairs){
+//         const s = Array.isArray(snaps) ? snaps.find(z => String(z.conid)===String(p.conid)) : null;
+//         if (!s) continue;
+//         rows.push(mapEquitySnapshot(p.sym, s)); // keep your existing mapper
+//       }
+//     }
+
+//     if (rows.length){
+//       STATE.equities_ts = rows;
+//       wsBroadcast("equity_ts", rows);
+//     }
+//   }catch(e){
+//     console.warn("pollEquitiesOnce:", e.message);
+//   }
+// }
+// helper: prefer last; else mid; else NaN
+function midOrLast(t) {
+  const last = Number(t?.last);
+  if (Number.isFinite(last) && last !== 0) return last;
+  const bid = Number(t?.bid), ask = Number(t?.ask);
+  if (Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 && ask > 0) {
+    return (bid + ask) / 2;
+  }
+  return NaN;
+}
+// function midOrLast(row) {
+//   const last = Number(row?.last);
+//   if (Number.isFinite(last) && last !== 0) return last;
+//   const bid = Number(row?.bid), ask = Number(row?.ask);
+//   if (Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 && ask > 0) return (bid + ask) / 2;
+//   return NaN;
+// }
+
+function fresh(row, ms=60_000) { return row?.ts && (Date.now() - row.ts) < ms; }
+function safeMapEquity(sym, snap) {
+  const r = mapEquitySnapshot(sym, snap); // your existing mapper (31/84/86/7059)
+  if (r && r.last != null && (r.bid == null || r.ask == null)) {
+    const px = Number(r.last);
+    if (Number.isFinite(px)) {
+      // 2bp synthetic spread
+      r.bid ??= Number((px * 0.9998).toFixed(2));
+      r.ask ??= Number((px * 1.0002).toFixed(2));
+    }
+  }
+  return r;
+}
 async function pollEquitiesOnce(){
   try{
-    const symbols = normEquities(WATCH);
+    const symbols = Array.from(WATCH.equities || []).map(normalizeSymbol);
     if (!symbols.length) return;
 
     const pairs = [];
     for (const sym of symbols){
-      try { const conid = await ibConidForSymbol(sym); if (conid) pairs.push({ sym, conid }); }
-      catch {}
+      try {
+        const conid = await ensureConid(sym); // ES should resolve to front-month
+        if (conid) pairs.push({ sym, conid });
+      } catch {}
     }
     if (!pairs.length) return;
 
     let rows = [];
     if (MOCK){
-      rows = pairs.map(p => ({ symbol:p.sym, last:100+Math.random()*50, bid:0, ask:0, ts:Date.now(), iv: p.sym==="MSFT" ? 0.40 : 1.00 }));
-    } else {
+      rows = pairs.map(p => ({
+        symbol: p.sym,
+        last: 100 + Math.random()*50,
+        bid: 0, ask: 0, iv: p.sym==="MSFT" ? 0.40 : 1.00,
+        ts: Date.now()
+      }));
+    }else{
       const conids = pairs.map(p=>p.conid).join(",");
-      const snaps  = await ibFetch(`/iserver/marketdata/snapshot?conids=${encodeURIComponent(conids)}&fields=31,84,86,7059`);
+      // 31: last, 84: bid, 86: ask, 7059: IV
+      const snaps = await ibFetch(`/iserver/marketdata/snapshot?conids=${encodeURIComponent(conids)}&fields=31,84,86,7059`);
       for (const p of pairs){
         const s = Array.isArray(snaps) ? snaps.find(z => String(z.conid)===String(p.conid)) : null;
         if (!s) continue;
-        rows.push(mapEquitySnapshot(p.sym, s));
+        // rows.push(mapEquitySnapshot(p.sym, s));
+        rows.push(safeMapEquity(p.sym, s));
       }
     }
-    if (rows.length){ STATE.equities_ts = rows; wsBroadcast("equity_ts", rows); }
-  }catch(e){ console.warn("pollEquitiesOnce:", e.message); }
+
+    // ----- compute ES–SPX basis (points) -----
+    let es_spx_basis = null;
+    const bySym = new Map(rows.map(r => [normalizeSymbol(r.symbol), r]));
+    const es = bySym.get("ES");
+    const spx = bySym.get("SPX");
+    if (es && spx && fresh(es) && fresh(spx)) {
+      const esPx  = midOrLast(es);
+      const spxPx = midOrLast(spx);
+      if (Number.isFinite(esPx) && Number.isFinite(spxPx)) {
+        es_spx_basis = Number((esPx - spxPx).toFixed(2));
+      }
+
+      // broadcast the richer payload your UI expects
+      STATE.equities_ts = rows;
+      // wsBroadcast("equity_ts", { rows, es_spx_basis });
+      wsBroadcast("equity_ts", rows);
+      if (es_spx_basis != null) wsBroadcast("basis", { es_spx_basis });      
+    }
+  }catch(e){
+    console.warn("pollEquitiesOnce:", e.message);
+  }
 }
+
+app.get("/debug/snapshot_raw", async (req,res)=>{
+  try {
+    const conids = String(req.query.conids||"").trim();
+    if (!conids) return res.status(400).json({ error:"conids required" });
+    const body = await ibFetch(`/iserver/marketdata/snapshot?conids=${encodeURIComponent(conids)}&fields=31,84,86,7059`);
+    res.json(body);
+  } catch(e){ res.status(500).json({ error:e.message }); }
+});
+
+// async function pollEquitiesOnce(){
+//   try{
+//     // 1) normalize & de-dup watchlist ("/ES" -> "ES")
+//     const symbols = Array.from(new Set(Array.from(WATCH.equities || []).map(normalizeSymbol)));
+//     if (!symbols.length) return;
+
+//     // 2) resolve conids (ES via front-month resolver in ensureConid)
+//     let pairs = [];
+//     for (const sym of symbols){
+//       try{
+//         const conid = await ensureConid(sym);
+//         if (conid) pairs.push({ sym: sym.toUpperCase(), conid: String(conid) });
+//       } catch {}
+//     }
+//     if (!pairs.length) return;
+
+//     // 2a) guard against ES/SPX conid collisions (ES accidentally resolved as SPX index)
+//     const es = pairs.find(p => p.sym === "ES");
+//     const spx = pairs.find(p => p.sym === "SPX");
+//     if (es && spx && es.conid === spx.conid){
+//       // nuke ES caches so front-month resolver runs cleanly
+//       try { FUT_FRONT?.delete?.("ES"); } catch {}
+//       try { CACHE?.conidBySym?.delete?.("ES"); } catch {}
+//       // re-resolve ES once
+//       try {
+//         const fixed = await ensureConid("ES");
+//         if (fixed && String(fixed) !== spx.conid){
+//           // replace the bad ES pair
+//           pairs = pairs.map(p => p.sym === "ES" ? ({ sym: "ES", conid: String(fixed) }) : p);
+//         } else {
+//           // if still colliding, drop ES for this tick; it will fix on next loop
+//           pairs = pairs.filter(p => p.sym !== "ES");
+//         }
+//       } catch {
+//         pairs = pairs.filter(p => p.sym !== "ES");
+//       }
+//     }
+
+//     if (!pairs.length) return;
+
+//     // 3) fetch snapshots
+//     let rows = [];
+//     if (MOCK){
+//       const now = Date.now();
+//       rows = pairs.map(p => ({
+//         symbol: p.sym,
+//         last: 100 + Math.random()*50 + (p.sym === "ES" ? 0.37 : 0), // make ES visibly different in mock
+//         bid: null, ask: null,
+//         iv: p.sym==="MSFT" ? 0.40 : null,
+//         ts: now
+//       }));
+//     } else {
+//       const conids = pairs.map(p=>p.conid).join(",");
+//       const snaps  = await ibFetch(`/iserver/marketdata/snapshot?conids=${encodeURIComponent(conids)}&fields=31,84,86,7059`);
+//       const arr = Array.isArray(snaps) ? snaps : (snaps?.data ?? []); // be tolerant
+
+//       // Build a fast lookup by conid
+//       const byConid = new Map();
+//       for (const s of arr) {
+//         if (s && (s.conid || s.conid === 0)) byConid.set(String(s.conid), s);
+//       }
+
+//       // wrapper around your existing mapper with optional synthetic spread
+//       function safeMap(sym, snap){
+//         const r = mapEquitySnapshot(sym, snap); // uses 31/84/86/7059
+//         if (r && r.last != null && (r.bid == null || r.ask == null)) {
+//           // synthesize a tiny spread so UI isn't empty when IB omits bid/ask (indexes/futures)
+//           const px = Number(r.last);
+//           if (!Number.isNaN(px)) {
+//             r.bid ??= Number((px * 0.999).toFixed(2));
+//             r.ask ??= Number((px * 1.001).toFixed(2));
+//           }
+//         }
+//         return r;
+//       }
+
+//       for (const p of pairs){
+//         const s = byConid.get(p.conid);
+//         if (!s) continue;
+//         const row = safeMap(p.sym, s);
+//         if (row) rows.push(row);
+//       }
+//     }
+
+//     // 4) publish
+//     // if (rows.length){
+//     //   STATE.equities_ts = rows;
+//     //   wsBroadcast("equity_ts", rows);
+//     // }
+//     if (rows.length){
+//       const enriched = rows.map(enrichRow);
+//       const basis = computeBasis(enriched); // e.g., +2.15 means ES > SPX by 2.15 pts
+//       STATE.equities_ts = enriched;
+//       wsBroadcast("equity_ts", { rows: enriched, es_spx_basis: basis });
+//     }    
+//   }catch(e){
+//     console.warn("pollEquitiesOnce:", e?.message || e);
+//   }
+// }
+function enrichRow(r){
+  const kind = (r.symbol === "ES") ? "future" :
+               (r.symbol === "SPX") ? "index"  : "equity";
+  return { ...r, kind };
+}
+function computeBasis(rows){
+  const spx = rows.find(r => r.symbol === "SPX" && r.last != null);
+  const es  = rows.find(r => r.symbol === "ES"  && r.last != null);
+  if (!spx || !es) return null;
+  return Number((es.last - spx.last).toFixed(2)); // ES - SPX
+}
+// async function pollEquitiesOnce(){
+//   try{
+//     const symbols = normEquities(WATCH);
+//     if (!symbols.length) return;
+
+//     const pairs = [];
+//     for (const sym of symbols){
+//       try { const conid = await ibConidForSymbol(sym); if (conid) pairs.push({ sym, conid }); }
+//       catch {}
+//     }
+//     if (!pairs.length) return;
+
+//     let rows = [];
+//     if (MOCK){
+//       rows = pairs.map(p => ({ symbol:p.sym, last:100+Math.random()*50, bid:0, ask:0, ts:Date.now(), iv: p.sym==="MSFT" ? 0.40 : 1.00 }));
+//     } else {
+//       const conids = pairs.map(p=>p.conid).join(",");
+//       const snaps  = await ibFetch(`/iserver/marketdata/snapshot?conids=${encodeURIComponent(conids)}&fields=31,84,86,7059`);
+//       for (const p of pairs){
+//         const s = Array.isArray(snaps) ? snaps.find(z => String(z.conid)===String(p.conid)) : null;
+//         if (!s) continue;
+//         rows.push(mapEquitySnapshot(p.sym, s));
+//       }
+//     }
+//     if (rows.length){ STATE.equities_ts = rows; wsBroadcast("equity_ts", rows); }
+//   }catch(e){ console.warn("pollEquitiesOnce:", e.message); }
+// }
 /* ===== NBBO + OCC key + raw print fanout ===== */
 const NBBO_OPT = new Map(); // key: occ -> { bid, ask, ts }
 
@@ -815,7 +1498,33 @@ function pushAndFanout(msg) {
     wsBroadcast("prints", [msg]); // light push; clients can aggregate if needed
   }
 }
+function toNum(x){ const n = Number(x); return Number.isFinite(n) ? n : null; }
 
+function normalizeQuoteFields(raw){
+  // raw = IB snapshot keyed object (strings). Field names may differ; we defensively pull all common ones.
+  const last = toNum(raw.last) ?? toNum(raw.lastPrice) ?? toNum(raw.trade) ?? null;
+  const close = toNum(raw.close) ?? toNum(raw.prevClose) ?? null;
+  const bid = toNum(raw.bid) ?? toNum(raw.bestBid) ?? null;
+  const ask = toNum(raw.ask) ?? toNum(raw.bestAsk) ?? null;
+
+  let lastFixed = last ?? (bid && ask ? (bid + ask) / 2 : close ?? null);
+
+  // sanity: sometimes indices/futures come in cents or odd scales. If it looks tiny vs. SPY/QQQ levels, prefer mid.
+  if (lastFixed !== null && ask !== null && bid !== null) {
+    const mid = (bid + ask) / 2;
+    // if last is way off from mid (e.g., badly scaled), trust mid
+    if (Math.abs(lastFixed - mid) / Math.max(1, mid) > 0.5) lastFixed = mid;
+  }
+
+  const iv = toNum(raw.impliedVol) ?? toNum(raw.iv) ?? null;
+
+  return {
+    last: lastFixed !== null ? Number(lastFixed.toFixed(2)) : null,
+    bid:  bid  !== null ? Number(bid.toFixed(2))  : null,
+    ask:  ask  !== null ? Number(ask.toFixed(2))  : null,
+    iv:   iv   !== null ? Math.round(iv * (iv < 5 ? 100 : 1)) : null, // handle 0.12 vs 12%
+  };
+}
 const LAST_BAR_OPT = new Map(); // conid -> { t, c, v }
 async function pollOptionsOnce(){
   try{
@@ -957,8 +1666,16 @@ const TAPE_CFG = {
 //   ts: number;                  // ms epoch
 // };
 /* ================= WATCHLIST ROUTES ================= */
-app.get("/watchlist/equities", (_req, res) => {
-  res.json({ equities: STATE.watchlist.equities || [] });
+// app.get("/watchlist/equities", (_req, res) => {
+//   res.json({ equities: STATE.watchlist.equities || [] });
+// });
+
+app.post("/watchlist/equities", express.json(), async (req, res) => {
+  const raw = (req.body?.symbol || "").toString().trim();
+  if (!raw) return res.status(400).json({ error: "symbol required" });
+  await watchAddEquities([normalizeSymbol(raw)]);
+  wsBroadcast("watchlist", getWatchlist());
+  res.json({ ok: true, watchlist: getWatchlist() });
 });
 
 // app.post("/watchlist/equities", express.json(), (req, res) => {
@@ -972,13 +1689,13 @@ app.get("/watchlist/equities", (_req, res) => {
 
 //   res.json({ ok: true, equities: STATE.watchlist.equities });
 // });
-app.post("/watchlist/equities", express.json(), async (req, res) => {
-  const raw = (req.body?.symbol || "").toString().trim();
-  if (!raw) return res.status(400).json({ error: "symbol required" });
-  await watchAddEquities([raw.toUpperCase()]);
-  wsBroadcast("watchlist", getWatchlist());
-  res.json({ ok: true, watchlist: getWatchlist() });
-});
+// app.post("/watchlist/equities", express.json(), async (req, res) => {
+//   const raw = (req.body?.symbol || "").toString().trim();
+//   if (!raw) return res.status(400).json({ error: "symbol required" });
+//   await watchAddEquities([raw.toUpperCase()]);
+//   wsBroadcast("watchlist", getWatchlist());
+//   res.json({ ok: true, watchlist: getWatchlist() });
+// });
 
 // app.delete("/watchlist/equities/:symbol", (req, res) => {
 //   const sym = (req.params.symbol || "").toUpperCase();
@@ -986,13 +1703,18 @@ app.post("/watchlist/equities", express.json(), async (req, res) => {
 //   STATE.watchlist.equities = next;
 //   res.json({ ok: true, equities: next });
 // });
+// app.delete("/watchlist/equities/:symbol", async (req, res) => {
+//   const sym = (req.params.symbol || "").toUpperCase();
+//   WATCH.equities.delete(sym);
+//   wsBroadcast("watchlist", getWatchlist());
+//   res.json({ ok: true, watchlist: getWatchlist() });
+// });
 app.delete("/watchlist/equities/:symbol", async (req, res) => {
-  const sym = (req.params.symbol || "").toUpperCase();
+  const sym = normalizeSymbol(req.params.symbol || "");
   WATCH.equities.delete(sym);
   wsBroadcast("watchlist", getWatchlist());
   res.json({ ok: true, watchlist: getWatchlist() });
 });
-
 /* Optional: read-only demo options endpoint */
 app.get("/watchlist/options", (_req, res) => {
   res.json({ options: STATE.watchlist.options || [] });
@@ -1212,7 +1934,7 @@ wss.on("connection", (ws) => {
   wsSend(ws, "options_ts", STATE.options_ts || []);
   wsSend(ws, "sweeps",    STATE.sweeps    || []);
   wsSend(ws, "blocks",    STATE.blocks    || []);
-  wsSend(ws, "watchlist", getWatchlist());
+  wsSend(ws, "watchlist", getWatchlist()); // <-- shared
 });
 (async () => {
   try { await seedWatchlist(); } catch (e) { console.warn("seedWatchlist:", e.message); }
