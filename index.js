@@ -14,6 +14,8 @@ import { WebSocketServer } from "ws";
 import fs from "fs";
 
 import { router as watchlistRouter } from "./routes/watchlist.js";
+import { loadWatchlistFile, saveWatchlistFile, buildOptionsAroundATM } from "./watchlist.js";
+
 import {
   WATCH, getWatchlist, addEquity, addOptions, normalizeSymbol,
   setBroadcaster, broadcastWatchlist
@@ -46,13 +48,23 @@ const STATE = {
   options_ts:  [],                     // [{underlying,expiration,strike,right,last,bid,ask,ts}]
   sweeps:      [],                     // UI shape for Sweeps screen
   blocks:      [],                     // UI shape for Blocks screen
+  prints:      [],   // <— add this
 };
+
 const CACHE = {
   conidBySym: new Map(),               // key: "AAPL" -> { conid, ts }
   expBySym:   new Map(),               // key: "AAPL" -> { ts, expirations: [...] }
   sessionPrimed: false,
   primingSince: 0,
 };
+const ROLLING_MS = 2 * 60_000; // 2 minutes for headlines window
+
+function pruneTapeAges() {
+  const cutoff = Date.now() - ROLLING_MS;
+  if (STATE.sweeps?.length) STATE.sweeps = STATE.sweeps.filter(x => x.ts >= cutoff);
+  if (STATE.blocks?.length) STATE.blocks = STATE.blocks.filter(x => x.ts >= cutoff);
+  if (STATE.prints?.length) STATE.prints = STATE.prints.filter(x => x.ts >= cutoff);
+}
 
 if (String(process.env.NODE_TLS_REJECT_UNAUTHORIZED) === "0") {
   console.warn("WARNING: TLS verification disabled (self-signed).");
@@ -62,6 +74,11 @@ console.log(`HTTP+WS @ :${PORT}  MOCK=${MOCK?"on":"off"}  IB=${IB_BASE}`);
 /* ================= APP/WS ================= */
 const app = express();
 
+app.use(express.json());
+app.use("/watchlist", watchlistRouter);
+app.use(cors());                // if you need to lock this down: cors({ origin: [/localhost/, /tradeflow\.lol$/] })
+app.use(compression());
+app.use(morgan("dev"));
 const FUT_ALIASES = new Map([["/ES","ES"], ["ES","ES"]]);
 
 /* ================= WATCHLIST STATE ================= */
@@ -139,11 +156,46 @@ if (!STATE.watchlist) STATE.watchlist = { equities: [], options: [] };
 //   .split(",")
 //   .map(s => s.trim().toUpperCase())
 //   .filter(Boolean);
+const POPULAR_50 = [
+  "SPY","QQQ","IWM","DIA","TLT","HYG","GLD","SLV","GDX","USO","SPX","ES",
+  "AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA","AVGO","AMD","NFLX","SMCI","MU","TSM","INTC","CSCO","IBM","ORCL","CRM",
+  "JPM","BAC","WFC","MS","GS","V","MA","PYPL","SQ","COIN",
+  "XOM","CVX","COP","OXY",
+  "UNH","JNJ","MRK","PFE","COST","HD","DIS"
+];
 
-const DEFAULT_EQUITIES = (process.env.DEFAULT_EQUITIES || "SPY,QQQ,IWM,AAPL,NVDA,MSFT,SPX,ES")
-  .split(",")
-  .map(s => s.trim().toUpperCase())
-  .filter(Boolean);
+const DEFAULT_EQUITIES =
+  (process.env.DEFAULT_EQUITIES || POPULAR_50.join(","))
+    .split(",")
+    .map(s => s.trim().toUpperCase())
+    .filter(Boolean);
+
+// during startup, if your in-mem watchlist is empty:
+if (WATCH.equities.size === 0) {
+  DEFAULT_EQUITIES.forEach(s => addEquity(s));
+  // optionally persist
+}
+// const POPULAR_50 = [
+//   // ETFs & index/future
+//   "SPY","QQQ","IWM","DIA","TLT","HYG","GLD","SLV","GDX","USO","SPX","ES",
+//   // Mega-cap tech + semis
+//   "AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA","AVGO","AMD","NFLX","SMCI","MU","TSM","INTC","CSCO","IBM","ORCL","CRM",
+//   // Fin/Payments
+//   "JPM","BAC","WFC","MS","GS","V","MA","PYPL","SQ","COIN",
+//   // Energy
+//   "XOM","CVX","COP","OXY",
+//   // Health / Staples / Retail / Discretionary
+//   "UNH","JNJ","MRK","PFE","COST","HD","DIS"
+// ];
+
+// // const DEFAULT_EQUITIES = (process.env.DEFAULT_EQUITIES || "SPY,QQQ,IWM,AAPL,NVDA,MSFT,SPX,ES")
+// //   .split(",")
+// //   .map(s => s.trim().toUpperCase())
+// //   .filter(Boolean);
+// const DEFAULT_EQUITIES = (process.env.DEFAULT_EQUITIES || POPULAR_50.join(","))
+//   .split(",")
+//   .map(s => s.trim().toUpperCase())
+//   .filter(Boolean);
 
 function toNumStrict(x) {
   if (typeof x === "number" && Number.isFinite(x)) return x;
@@ -166,6 +218,10 @@ const DEFAULT_OPTIONS = (process.env.DEFAULT_OPTIONS || "").trim()
     ];
 const SEED_MARK = ".seeded";
 
+
+/* ================= IB HELPERS (cached) ================= */
+const CONID_TTL_MS = 12*60*60*1000;
+const EXP_TTL_MS   = 30*60*1000;
 // function seedWatchlist() {
 //   // equities
 //   const existing = new Set((STATE.watchlist.equities || []).map(s => s.toUpperCase()));
@@ -216,11 +272,6 @@ async function seedWatchlist() {
 
 seedWatchlist();
 
-app.use(express.json());
-app.use("/watchlist", watchlistRouter);
-app.use(cors());                // if you need to lock this down: cors({ origin: [/localhost/, /tradeflow\.lol$/] })
-app.use(compression());
-app.use(morgan("dev"));
 
 const server = http.createServer(app);
 
@@ -278,7 +329,119 @@ function nextFridays(n=2){
   }
   return out;
 }
+// const STATE = {
+//   equities_ts: [],
+//   options_ts:  [],
+//   sweeps:      [],
+//   blocks:      [],
+//   prints:      [],   // <— add this
+// };
+// somewhere near your data ingestion
+const LAST_TRADES = [];          // ring buffer of recent option prints
+const MAX_TRADES  = 5000;
 
+/** Push a normalized trade event into buffer */
+function onOptionTrade(ev) {
+  // expected ev fields:
+  // { ul, right:"C"|"P", strike:number, expiry:"YYYY-MM-DD",
+  //   side:"BUY"|"SELL", qty:number, price:number, notional:number, ts:number }
+  LAST_TRADES.push(ev);
+  if (LAST_TRADES.length > MAX_TRADES) LAST_TRADES.splice(0, LAST_TRADES.length - MAX_TRADES);
+}
+/**
+ * Return large single prints as "blocks".
+ */
+function synthesizeBlocksFrom(events, { topN = 24, minNotional = 50_000, minQty = 200, windowMs = 5 * 60_000 } = {}) {
+  const now = Date.now();
+  const rows = [];
+
+  for (const e of events) {
+    if ((now - e.ts) > windowMs) continue;              // recent only
+    if (e.notional >= minNotional && e.qty >= minQty) {
+      rows.push({
+        ul: e.ul, right: e.right, strike: e.strike, expiry: e.expiry,
+        side: e.side, qty: e.qty, price: e.price,
+        notional: e.notional, ts: e.ts, age: Math.max(0, Math.round((now - e.ts)/1000))
+      });
+    }
+  }
+
+  rows.sort((a,b) => b.ts - a.ts);
+  return rows.slice(0, topN);
+}
+/**
+ * Collapse many small prints into "sweeps" by time clustering.
+ */
+function synthesizeSweepsFrom(events, {
+  topN = 120,
+  minNotional = 25_000,
+  minQty = 100,
+  legGapMs = 350,        // time gap that keeps a cluster going
+  maxClusterMs = 2000,   // stop clustering after this total span
+  windowMs = 5 * 60_000  // only look back this far
+} = {}) {
+  const now = Date.now();
+
+  // group by contract+side
+  const byKey = new Map(); // key -> sorted events
+  for (const e of events) {
+    if ((now - e.ts) > windowMs) continue;
+    const key = `${e.ul}|${e.right}|${e.strike}|${e.expiry}|${e.side}`;
+    if (!byKey.has(key)) byKey.set(key, []);
+    byKey.get(key).push(e);
+  }
+
+  const sweeps = [];
+
+  for (const [key, arr] of byKey) {
+    // sort by time asc to build clusters
+    arr.sort((a,b) => a.ts - b.ts);
+
+    let cluster = [];
+    let clusterStart = 0;
+
+    const flush = () => {
+      if (!cluster.length) return;
+      const qty = cluster.reduce((s,x)=>s+x.qty, 0);
+      const notional = cluster.reduce((s,x)=>s+x.notional, 0);
+      if (qty >= minQty && notional >= minNotional && cluster.length >= 2) {
+        const vwap = cluster.reduce((s,x)=>s + x.price*x.qty, 0) / qty;
+        const first = cluster[0], last = cluster[cluster.length-1];
+        const [ul, right, strike, expiry, side] = key.split("|");
+        sweeps.push({
+          ul, right, strike: Number(strike), expiry, side,
+          qty, price: vwap, notional,
+          ts: last.ts, age: Math.max(0, Math.round((now - last.ts)/1000))
+        });
+      }
+      cluster = [];
+      clusterStart = 0;
+    };
+
+    for (let i=0;i<arr.length;i++){
+      const t = arr[i];
+      if (!cluster.length) {
+        cluster = [t];
+        clusterStart = t.ts;
+        continue;
+      }
+      const gap = t.ts - cluster[cluster.length-1].ts;
+      const span = t.ts - clusterStart;
+
+      if (gap <= legGapMs && span <= maxClusterMs) {
+        cluster.push(t);
+      } else {
+        flush();
+        cluster = [t];
+        clusterStart = t.ts;
+      }
+    }
+    flush();
+  }
+
+  sweeps.sort((a,b)=> b.ts - a.ts);
+  return sweeps.slice(0, topN);
+}
 /** Build a small options chain near the money for demo */
 function seedDemoOptionsFromULs(uls){
   const expiries = nextFridays(2);          // e.g., ['2025-11-07','2025-11-14']
@@ -334,14 +497,59 @@ function normalizePrint(t, kind = "SWEEP"){
 const SEEDED_EQUITIES = ["SPY","QQQ","IWM","AAPL","NVDA","MSFT"];
 
 // Seed options once at startup (and you can call it again after quotes appear)
-function seedDemoOptions(){
-  const opts = seedDemoOptionsFromULs(SEEDED_EQUITIES);
-  STATE.options_ts = opts;
-  console.log("Seeded demo options:", 
-    opts.slice(0,4).map(o => `${o.underlying} ${o.right} ${o.strike} ${o.expiration}`).join(" | "),
-    `(+${Math.max(0, opts.length-4)} more)`
-  );
+// function seedDemoOptions(){
+//   const opts = seedDemoOptionsFromULs(SEEDED_EQUITIES);
+//   STATE.options_ts = opts;
+//   console.log("Seeded demo options:", 
+//     opts.slice(0,4).map(o => `${o.underlying} ${o.right} ${o.strike} ${o.expiration}`).join(" | "),
+//     `(+${Math.max(0, opts.length-4)} more)`
+//   );
+// }
+// server/index.js (or wherever you compute headlines)
+let lastBlocks = "", lastSweeps = "";
+
+function computeBlocks(topN = 20, minNotional = 50_000) {
+  // TODO: your real logic; below just transforms STATE.options_ts into blocks
+  // Return array like [{ul:"SPY", right:"P", strike:510, expiry:"2025-11-07", side:"BUY", qty:300, notional:150000}]
+  return synthesizeBlocksFrom(STATE.options_ts, { topN, minNotional });
 }
+
+function computeSweeps(topN = 50, minNotional = 25_000) {
+  // Similar shape, but “sweep” logic distinct from blocks
+  return synthesizeSweepsFrom(STATE.options_ts, { topN, minNotional });
+}
+
+setInterval(() => {
+  const blocks = synthesizeBlocksFrom(LAST_TRADES, { topN: 24, minNotional: 50_000, minQty: 200 });
+  const sweeps = synthesizeSweepsFrom(LAST_TRADES, { topN: 120, minNotional: 25_000, minQty: 100 });
+
+  const bJson = JSON.stringify(blocks);
+  const sJson = JSON.stringify(sweeps);
+
+  if (bJson !== lastBlocks) {
+    wsBroadcast("blocks", blocks);
+    lastBlocks = bJson;
+  }
+  if (sJson !== lastSweeps) {
+    wsBroadcast("sweeps", sweeps);
+    lastSweeps = sJson;
+  }
+}, 1000);
+
+function seedDemoOptions(){
+  const wf = loadWatchlistFile();
+  const uls = (wf?.equities ?? []).map(s => s.toUpperCase());
+  const opts = seedDemoOptionsFromULs(uls.length ? uls : DEFAULT_EQUITIES);
+  STATE.options_ts = opts;
+  console.log("Seeded demo options for", uls.length, "symbols");
+}
+let lastHeadlinesJson = "";
+setInterval(() => {
+  const headlines = computeHeadlines({ windowMs: ROLLING_MS, minNotional: 50_000, topN: 12 });
+  const s = JSON.stringify(headlines);
+  if (s !== lastHeadlinesJson) { wsBroadcast("headlines", headlines); lastHeadlinesJson = s; }
+}, 2000);
+
 let FUT_FRONT = new Map(); // "ES" -> { symbol:"ESZ5", conid: 12345, display:"ESZ5" }
 
 async function resolveFrontMonth(symbol){ // symbol like "ES"
@@ -818,10 +1026,6 @@ async function ibFetch(path, opts={}, _retry=false){
   return res;
 }
 
-/* ================= IB HELPERS (cached) ================= */
-const CONID_TTL_MS = 12*60*60*1000;
-const EXP_TTL_MS   = 30*60*1000;
-
 async function ibConidForStock(sym){
   if (!isNonEmptyStr(sym)) return null;
   const key = sym.toUpperCase();
@@ -931,6 +1135,15 @@ async function ibOptMonthsForSymbol(sym){
 // function mapOptionTick(ul, expiration, strike, right, s0){
 //   return { underlying:ul, expiration, strike, right, last:num(s0["31"]), bid:num(s0["84"]), ask:num(s0["86"]), ts:Date.now() };
 // }
+
+// Real-time last price cache: lastBySymbol["SPY"] = 504.23, etc.
+const lastBySymbol = Object.create(null);
+const getLast = (sym) => {
+  const v = lastBySymbol[sym?.toUpperCase()?.replace(/^\//, "")];
+  return Number.isFinite(v) ? v : null;
+};
+
+
 function mapEquitySnapshot(sym, s) {
   const last = toNumStrict(s["31"]);
   const bid  = toNumStrict(s["84"]);
@@ -1273,7 +1486,6 @@ async function pollEquitiesOnce(){
         rows.push(safeMapEquity(p.sym, s));
       }
     }
-
     // ----- compute ES–SPX basis (points) -----
     let es_spx_basis = null;
     const bySym = new Map(rows.map(r => [normalizeSymbol(r.symbol), r]));
@@ -1285,7 +1497,8 @@ async function pollEquitiesOnce(){
       if (Number.isFinite(esPx) && Number.isFinite(spxPx)) {
         es_spx_basis = Number((esPx - spxPx).toFixed(2));
       }
-
+      
+      for (const r of rows) if (Number.isFinite(r?.last)) onTick(r.symbol, r.last);
       // broadcast the richer payload your UI expects
       STATE.equities_ts = rows;
       // wsBroadcast("equity_ts", { rows, es_spx_basis });
@@ -1297,6 +1510,21 @@ async function pollEquitiesOnce(){
   }
 }
 
+// GET /api/flow/blocks?minNotional=50000&limit=50
+app.get("/api/flow/blocks", (req,res)=>{
+  const minNotional = Number(req.query.minNotional ?? 50_000);
+  const limit = Number(req.query.limit ?? 50);
+  const rows = computeBlocks(9999, minNotional).slice(0, limit);
+  res.json({ rows, ts: Date.now() });
+});
+
+// GET /api/flow/sweeps?minNotional=25000&limit=200
+app.get("/api/flow/sweeps", (req,res)=>{
+  const minNotional = Number(req.query.minNotional ?? 25_000);
+  const limit = Number(req.query.limit ?? 200);
+  const rows = computeSweeps(9999, minNotional).slice(0, limit);
+  res.json({ rows, ts: Date.now() });
+});
 app.get("/debug/snapshot_raw", async (req,res)=>{
   try {
     const conids = String(req.query.conids||"").trim();
@@ -1495,6 +1723,7 @@ function pushAndFanout(msg) {
   if (msg?.type === "print") {
     // you can keep a rolling buffer if you want
     // e.g., STATE.prints = [...(STATE.prints||[]), msg].slice(-2000);
+    STATE.prints = [...(STATE.prints || []), msg].slice(-2000);
     wsBroadcast("prints", [msg]); // light push; clients can aggregate if needed
   }
 }
@@ -1544,6 +1773,8 @@ async function pollOptionsOnce(){
       const underPx = Number((Array.isArray(snap) && snap[0] && snap[0]["31"]) ?? NaN);
       if (!Number.isFinite(underPx)) continue;
 
+      // update equity last cache so ATM builder can work immediately
+      onTick(ul, underPx);
       let expiries = await ibOptMonthsForSymbol(ul);
       expiries = (expiries || []).slice(0,2);
 
@@ -1670,13 +1901,27 @@ const TAPE_CFG = {
 //   res.json({ equities: STATE.watchlist.equities || [] });
 // });
 
-app.post("/watchlist/equities", express.json(), async (req, res) => {
-  const raw = (req.body?.symbol || "").toString().trim();
-  if (!raw) return res.status(400).json({ error: "symbol required" });
-  await watchAddEquities([normalizeSymbol(raw)]);
-  wsBroadcast("watchlist", getWatchlist());
-  res.json({ ok: true, watchlist: getWatchlist() });
+// app.post("/watchlist/equities", express.json(), async (req, res) => {
+//   const raw = (req.body?.symbol || "").toString().trim();
+//   if (!raw) return res.status(400).json({ error: "symbol required" });
+//   await watchAddEquities([normalizeSymbol(raw)]);
+//   wsBroadcast("watchlist", getWatchlist());
+//   res.json({ ok: true, watchlist: getWatchlist() });
+// });
+app.post("/watchlist/equities", (req, res) => {
+  const sym = String(req.body?.symbol || "").toUpperCase().replace(/^\//, "");
+  if (!/^[A-Z0-9.\-_/]{1,10}$/.test(sym)) {
+    return res.status(400).json({ error: "bad symbol" });
+  }
+  const wf = loadWatchlistFile();
+  if (!wf.equities.includes(sym)) wf.equities.push(sym);
+  saveWatchlistFile(wf);
+
+  const payload = makeWatchlistPayload();
+  safeBroadcast({ topic: "watchlist", data: payload });
+  res.json({ ok: true, ...payload });
 });
+
 
 // app.post("/watchlist/equities", express.json(), (req, res) => {
 //   const raw = (req.body?.symbol || "").toString().trim();
@@ -1709,17 +1954,56 @@ app.post("/watchlist/equities", express.json(), async (req, res) => {
 //   wsBroadcast("watchlist", getWatchlist());
 //   res.json({ ok: true, watchlist: getWatchlist() });
 // });
-app.delete("/watchlist/equities/:symbol", async (req, res) => {
-  const sym = normalizeSymbol(req.params.symbol || "");
-  WATCH.equities.delete(sym);
-  wsBroadcast("watchlist", getWatchlist());
-  res.json({ ok: true, watchlist: getWatchlist() });
+// app.delete("/watchlist/equities/:symbol", async (req, res) => {
+//   const sym = normalizeSymbol(req.params.symbol || "");
+//   WATCH.equities.delete(sym);
+//   wsBroadcast("watchlist", getWatchlist());
+//   res.json({ ok: true, watchlist: getWatchlist() });
+// });
+
+// Remove equity (persists to file)
+app.delete("/watchlist/equities/:sym", (req, res) => {
+  const sym = String(req.params.sym || "").toUpperCase().replace(/^\//, "");
+  const wf = loadWatchlistFile();
+  wf.equities = wf.equities.filter((s) => s !== sym);
+  saveWatchlistFile(wf);
+
+  const payload = makeWatchlistPayload();
+  safeBroadcast({ topic: "watchlist", data: payload });
+  res.json({ ok: true, ...payload });
 });
+
+/* ---------- Tick updates: update lastBySymbol then (optionally) rebroadcast ---------- */
+function onTick(symbol, last) {
+  lastBySymbol[symbol.toUpperCase().replace(/^\//, "")] = Number(last);
+  // Optional (can be throttled): recompute to move the ATM band if price crossed a strike
+  // safeBroadcast({ topic: "watchlist", data: makeWatchlistPayload() });
+}
+
+/* ---------- WS broadcast wrapper (no-op if you don’t have it here) ---------- */
+function safeBroadcast(msg) {
+  try {
+    if (global.broadcast) global.broadcast(msg);
+    // else import your broadcast and call it
+  } catch {}
+}
+
 /* Optional: read-only demo options endpoint */
-app.get("/watchlist/options", (_req, res) => {
-  res.json({ options: STATE.watchlist.options || [] });
+// app.get("/watchlist/options", (_req, res) => {
+//   res.json({ options: STATE.watchlist.options || [] });
+// });
+function makeWatchlistPayload() {
+  const wf = loadWatchlistFile();
+  const options = wf.equities.flatMap((ul) => buildOptionsAroundATM(ul, getLast));
+  return { equities: wf.equities, options };
+}
+
+/* ---------- REST: single source of truth + generated options ---------- */
+app.get("/watchlist", (_req, res) => {
+  res.json(makeWatchlistPayload());
 });
- 
+
+
 // function normalizePrint(p) {
 //   return {
 //     ...p,
@@ -1935,6 +2219,7 @@ wss.on("connection", (ws) => {
   wsSend(ws, "sweeps",    STATE.sweeps    || []);
   wsSend(ws, "blocks",    STATE.blocks    || []);
   wsSend(ws, "watchlist", getWatchlist()); // <-- shared
+  wsSend(ws, "headlines", computeHeadlines());   // <— add this
 });
 (async () => {
   try { await seedWatchlist(); } catch (e) { console.warn("seedWatchlist:", e.message); }
@@ -1945,6 +2230,60 @@ setInterval(pollEquitiesOnce, 10_000);
 setInterval(pollOptionsOnce,  13_000);
 setInterval(pollSweepsOnce,    5_000);
 setInterval(pollBlocksOnce,    5_000);
+setInterval(pruneTapeAges, 2_000);
+function computeHeadlines({ windowMs = ROLLING_MS, minNotional = 50_000, topN = 12 } = {}) {
+  const now = Date.now();
+  const inWindow = (t) => now - (t?.ts || 0) <= windowMs;
+
+  const items = [];
+
+  // 1) Sweeps
+  for (const s of (STATE.sweeps || [])) {
+    if (!inWindow(s)) continue;
+    if ((s.notional || 0) < minNotional) continue;
+    items.push({ ...s, type: "SWEEP" });
+  }
+
+  // 2) Blocks
+  for (const b of (STATE.blocks || [])) {
+    if (!inWindow(b)) continue;
+    if ((b.notional || 0) < minNotional) continue;
+    items.push({ ...b, type: "BLOCK" });
+  }
+
+  // 3) Prints (raw → synthesize notional = qty * price * 100)
+  for (const p of (STATE.prints || [])) {
+    if (!inWindow(p)) continue;
+    const n = Math.round((p.qty || 0) * (p.price || 0) * 100);
+    if (n < minNotional) continue;
+    items.push({
+      type: "PRINT",
+      ul: p.symbol,
+      right: p.option?.right,
+      strike: p.option?.strike,
+      expiry: p.option?.expiration,
+      side: p.side || "UNKNOWN",
+      price: Number(p.price || 0),
+      qty: Number(p.qty || 0),
+      notional: n,
+      ts: p.ts,
+    });
+  }
+
+  items.sort((a, b) => (b.notional || 0) - (a.notional || 0));
+  return items.slice(0, topN);
+}
+// WS broadcast every 2s
+setInterval(() => {
+  const headlines = computeHeadlines({ windowMs: ROLLING_MS, minNotional: 50_000, topN: 12 });
+  wsBroadcast("headlines", headlines);
+}, 2_000);
+
+// REST endpoint (optional)
+app.get("/api/flow/headlines", (_req, res) => {
+  const top = computeHeadlines({ windowMs: ROLLING_MS, minNotional: 50_000, topN: 20 });
+  res.json(top);
+});
 
 /* ================= ROUTES ================= */
 app.get("/", (req,res)=>res.type("text/plain").send("TradeFlash server up\n"));
@@ -1959,7 +2298,7 @@ app.post("/watch/tradier", async (req, res) => {
   const added = await watchAddOptions(options);
   res.json({ ok:true, watching:getWatchlist(), added });
 });
-app.get("/watchlist", (req,res)=>res.json(getWatchlist()));
+// app.get("/watchlist", (req,res)=>res.json(getWatchlist()));
 
 app.get("/api/flow/chains", async (req,res)=>{
   try{
