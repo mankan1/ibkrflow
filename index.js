@@ -347,70 +347,183 @@ async function ibConidForStock(sym){
 }
 
 // --- ADD this small debug route somewhere near other /debug/* routes ---
-app.get("/debug/conid", async (req,res)=>{
+app.get("/debug/conid", async (req, res) => {
   try {
-    const symbol = String(req.query.symbol||"").toUpperCase();
-    if (!symbol) return res.status(400).json({ error:"symbol required" });
+    const symbol = String(req.query.symbol || "").toUpperCase();
+    if (!symbol) return res.status(400).json({ error: "symbol required" });
     const conid = await ibConidForStock(symbol);
-    res.json({ symbol, conid });
+    if (!conid) return res.status(404).json({ error: `No conid for ${symbol}` });
+    res.json({ symbol, conid: String(conid) });
   } catch (e) {
-    res.status(500).json({ error: e.message||"failed" });
+    res.status(500).json({ error: e.message });
   }
 });
 
-async function ibOptMonthsForSymbol(sym){
-  const key = sym.toUpperCase();
-  const hit = CACHE.expBySym.get(key);
-  if (hit && (Date.now()-hit.ts) < EXP_TTL_MS) return hit.expirations;
+// async function ibOptMonthsForSymbol(sym){
+//   const key = sym.toUpperCase();
+//   const hit = CACHE.expBySym.get(key);
+//   if (hit && (Date.now()-hit.ts) < EXP_TTL_MS) return hit.expirations;
 
-  if (MOCK){
-    const exps = [
-      "2025-12-19","2026-01-16","2026-02-20","2026-03-20","2026-04-17",
-      "2026-05-15","2026-06-19","2026-07-17","2026-09-18","2026-10-16",
-      "2027-01-15","2027-02-19","2027-07-16","2028-01-21","2028-02-18"
+//   if (MOCK){
+//     const exps = [
+//       "2025-12-19","2026-01-16","2026-02-20","2026-03-20","2026-04-17",
+//       "2026-05-15","2026-06-19","2026-07-17","2026-09-18","2026-10-16",
+//       "2027-01-15","2027-02-19","2027-07-16","2028-01-21","2028-02-18"
+//     ];
+//     CACHE.expBySym.set(key, { ts:Date.now(), expirations:exps });
+//     return exps;
+//   }
+
+//   // Parse OPT.months from secdef/search
+//   const body = await ibFetch(`/iserver/secdef/search?symbol=${encodeURIComponent(key)}`);
+//   const list = Array.isArray(body) ? body : (body ? [body] : []);
+//   const rec  = list.find(x => String(x?.symbol||"").toUpperCase()===key) || list[0];
+//   const optSec = (rec?.sections||[]).find(s => s?.secType==="OPT");
+//   const tokens = optSec?.months || "";
+//   const exps = monthsTokensToThirdFridays(tokens);
+//   CACHE.expBySym.set(key, { ts:Date.now(), expirations:exps });
+//   return exps;
+// }
+
+// function mapEquitySnapshot(sym, snap){
+//   const last = Number(snap?.["31"]);
+//   const bid  = Number(snap?.["84"]);
+//   const ask  = Number(snap?.["86"]);
+//   const iv   = Number(snap?.["7059"]); // may be undefined
+//   return {
+//     symbol: sym,
+//     last: Number.isFinite(last)?last:undefined,
+//     bid:  Number.isFinite(bid)?bid:undefined,
+//     ask:  Number.isFinite(ask)?ask:undefined,
+//     iv:   Number.isFinite(iv)?iv:undefined,
+//     ts:   Date.now()
+//   };
+// }
+// function mapOptionTick(underlying, expiration, strike, right, snap){
+//   const last = Number(snap?.["31"]);
+//   const bid  = Number(snap?.["84"]);
+//   const ask  = Number(snap?.["86"]);
+//   return {
+//     underlying, expiration, strike, right,
+//     last: Number.isFinite(last)?last:undefined,
+//     bid:  Number.isFinite(bid)?bid:undefined,
+//     ask:  Number.isFinite(ask)?ask:undefined,
+//     ts:   Date.now()
+//   };
+// }
+// async function pollEquitiesOnce() {
+//   try {
+//     const symbols = normEquities(WATCH).map(s => String(s).toUpperCase());
+//     if (!symbols.length) return;
+
+//     const pairs = [];
+//     for (const sym of symbols) {
+//       const conid = await ibConidForStock(sym);
+//       if (conid) pairs.push({ sym, conid });
+//     }
+//     if (!pairs.length) return;
+
+//     const conids = pairs.map(p => p.conid).join(",");
+//     const url = `${IB_BASE}/iserver/marketdata/snapshot?conids=${encodeURIComponent(conids)}&fields=31,84,86`;
+//     const snaps = await ibFetchJson(url);
+
+//     const rows = [];
+//     for (const p of pairs) {
+//       const snap = Array.isArray(snaps) ? snaps.find(s => String(s.conid) === String(p.conid)) : null;
+//       // If snapshot missing everything after hours, skip; we’ll keep previous STATE
+//       const r = snap ? mapEquitySnapshot(p.sym, snap) : null;
+//       if (r && (r.last != null || r.bid != null || r.ask != null)) rows.push(r);
+//     }
+
+//     // Only update/broadcast when we actually have fresh rows
+//     if (rows.length) {
+//       STATE.equities_ts = rows;
+//       wsBroadcast("equity_ts", rows);
+//     }
+//   } catch (e) {
+//     console.warn("pollEquitiesOnce error:", e.message);
+//   }
+// }
+// ===== Defaults (env overrideable) =====
+const DEFAULT_EQUITIES = (process.env.DEFAULT_EQUITIES || "AAPL,NVDA,MSFT").split(",")
+  .map(s => s.trim().toUpperCase()).filter(Boolean);
+
+// option seed examples (near-money weekly-ish)
+const DEFAULT_OPTIONS = (process.env.DEFAULT_OPTIONS || "").trim()
+  ? JSON.parse(process.env.DEFAULT_OPTIONS) // allow JSON array via env
+  : [
+      { underlying: "AAPL", expiration: "2025-12-19", strike: 200, right: "C" },
+      { underlying: "NVDA", expiration: "2025-12-19", strike: 150, right: "P" },
     ];
-    CACHE.expBySym.set(key, { ts:Date.now(), expirations:exps });
-    return exps;
+
+// persist seed so we don’t re-add after restarts (optional: simple file flag)
+import fs from "fs";
+const SEED_MARK = ".seeded";
+async function seedDefaultsOnce() {
+  try {
+    if (fs.existsSync(SEED_MARK)) return;
+
+    const curEq = new Set(normEquities(WATCH));
+    const toAddEq = DEFAULT_EQUITIES.filter(s => !curEq.has(s));
+    if (toAddEq.length) await watchAddEquities(toAddEq);
+
+    const curOptsKey = new Set(normOptions(WATCH).map(o => `${o.underlying}:${o.expiration}:${o.strike}:${o.right}`));
+    const toAddOpts = DEFAULT_OPTIONS.filter(o => {
+      const k = `${String(o.underlying).toUpperCase()}:${o.expiration}:${o.strike}:${String(o.right).toUpperCase()[0]}`;
+      return !curOptsKey.has(k);
+    });
+    if (toAddOpts.length) await watchAddOptions(toAddOpts);
+
+    // kick off first fetch immediately (so UI seeds without waiting)
+    await pollEquitiesOnce();
+    await pollOptionsOnce();
+
+    // then broadcast what we just fetched
+    wsBroadcast("watchlist", getWatchlist());
+    if (STATE.equities_ts?.length) wsBroadcast("equity_ts", STATE.equities_ts);
+    if (STATE.options_ts?.length)  wsBroadcast("options_ts", STATE.options_ts);
+
+    fs.writeFileSync(SEED_MARK, new Date().toISOString());
+    console.log(`[seed] added eq=${JSON.stringify(toAddEq)} opts=${toAddOpts.length}`);
+  } catch (e) {
+    console.warn("seedDefaultsOnce error:", e.message);
   }
-
-  // Parse OPT.months from secdef/search
-  const body = await ibFetch(`/iserver/secdef/search?symbol=${encodeURIComponent(key)}`);
-  const list = Array.isArray(body) ? body : (body ? [body] : []);
-  const rec  = list.find(x => String(x?.symbol||"").toUpperCase()===key) || list[0];
-  const optSec = (rec?.sections||[]).find(s => s?.secType==="OPT");
-  const tokens = optSec?.months || "";
-  const exps = monthsTokensToThirdFridays(tokens);
-  CACHE.expBySym.set(key, { ts:Date.now(), expirations:exps });
-  return exps;
 }
 
-function mapEquitySnapshot(sym, snap){
-  const last = Number(snap?.["31"]);
-  const bid  = Number(snap?.["84"]);
-  const ask  = Number(snap?.["86"]);
-  const iv   = Number(snap?.["7059"]); // may be undefined
-  return {
-    symbol: sym,
-    last: Number.isFinite(last)?last:undefined,
-    bid:  Number.isFinite(bid)?bid:undefined,
-    ask:  Number.isFinite(ask)?ask:undefined,
-    iv:   Number.isFinite(iv)?iv:undefined,
-    ts:   Date.now()
-  };
-}
-function mapOptionTick(underlying, expiration, strike, right, snap){
-  const last = Number(snap?.["31"]);
-  const bid  = Number(snap?.["84"]);
-  const ask  = Number(snap?.["86"]);
-  return {
-    underlying, expiration, strike, right,
-    last: Number.isFinite(last)?last:undefined,
-    bid:  Number.isFinite(bid)?bid:undefined,
-    ask:  Number.isFinite(ask)?ask:undefined,
-    ts:   Date.now()
-  };
-}
+// one-time seeding
+// async function seedDefaultsOnce() {
+//   try {
+//     if (fs.existsSync(SEED_MARK)) return; // already seeded once
 
+//     const curEq = new Set(normEquities(WATCH));
+//     const toAddEq = DEFAULT_EQUITIES.filter(s => !curEq.has(s));
+//     if (toAddEq.length) await watchAddEquities(toAddEq);
+
+//     const curOptsKey = new Set(normOptions(WATCH).map(o => `${o.underlying}:${o.expiration}:${o.strike}:${o.right}`));
+//     const toAddOpts = DEFAULT_OPTIONS.filter(o => {
+//       const k = `${String(o.underlying).toUpperCase()}:${o.expiration}:${o.strike}:${String(o.right).toUpperCase()[0]}`;
+//       return !curOptsKey.has(k);
+//     });
+//     if (toAddOpts.length) await watchAddOptions(toAddOpts);
+
+//     // broadcast the new watchlist and any cached snapshots
+//     wsBroadcast("watchlist", getWatchlist());
+//     if (STATE.equities_ts?.length) wsBroadcast("equity_ts", STATE.equities_ts);
+//     if (STATE.options_ts?.length)  wsBroadcast("options_ts", STATE.options_ts);
+
+//     fs.writeFileSync(SEED_MARK, new Date().toISOString());
+//     console.log(`[seed] added equities=${JSON.stringify(toAddEq)} options=${toAddOpts.length}`);
+//   } catch (e) {
+//     console.warn("seedDefaultsOnce error:", e.message);
+//   }
+// }
+
+function wsSendSnapshot(ws) {
+  if (STATE.equities_ts?.length) wsSend(ws, "equity_ts", STATE.equities_ts);
+  if (STATE.options_ts?.length)  wsSend(ws, "options_ts",  STATE.options_ts);
+  wsSend(ws, "sweeps", STATE.sweeps || []);   // these are fine to be empty
+  wsSend(ws, "blocks", STATE.blocks || []);
+}
 /* ================= POLLERS =================
    - Keep last known good values even if current cycle fails
    - Small per-call throttle + queue shields from 429 storms
@@ -454,85 +567,254 @@ async function pollEquitiesOnce(){
   }
 }
 
+async function pollSweepsOnce() {
+  try {
+    const next = await fetchSweepsFromProvider();  // <- your source
+    if (!Array.isArray(next)) return;
+
+    // Only broadcast if changed (cheap hash/len check)
+    const changed = JSON.stringify(next) !== JSON.stringify(STATE.sweeps || []);
+    STATE.sweeps = next;
+    if (changed) wsBroadcast("sweeps", STATE.sweeps);
+  } catch (e) {
+    console.warn("pollSweepsOnce error:", e.message);
+  }
+}
+
+async function pollBlocksOnce() {
+  try {
+    const next = await fetchBlocksFromProvider();
+    if (!Array.isArray(next)) return;
+
+    const changed = JSON.stringify(next) !== JSON.stringify(STATE.blocks || []);
+    STATE.blocks = next;
+    if (changed) wsBroadcast("blocks", STATE.blocks);
+  } catch (e) {
+    console.warn("pollBlocksOnce error:", e.message);
+  }
+}
+
+// Optional: send initial snapshot to new clients
+wss.on("connection", (ws) => {
+  try {
+    ws.send(JSON.stringify({ topic: "equity_ts", data: STATE.equities_ts || [] }));
+    ws.send(JSON.stringify({ topic: "options_ts", data: STATE.options_ts || [] }));
+    ws.send(JSON.stringify({ topic: "sweeps",    data: STATE.sweeps    || [] }));
+    ws.send(JSON.stringify({ topic: "blocks",    data: STATE.blocks    || [] }));
+  } catch {}
+});
+
 // Lower-traffic options poller:
 // 1) If explicit watched options exist -> resolve those only.
 // 2) Else sample one ATM C/P for each watched underlying (first monthly).
-async function pollOptionsOnce(){
+// async function pollOptionsOnce(){
+//   try {
+//     const explicit = normOptions(WATCH);
+//     const underlyings = normEquities(WATCH);
+
+//     const ticks = [];
+
+//     if (explicit.length){
+//       for (const o of explicit){
+//         try {
+//           const conidUL = await ibConidForStock(o.underlying);
+//           if (!conidUL) continue;
+
+//           // month=YYYYMM
+//           const month = o.expiration.replaceAll("-","").slice(0,6);
+//           // /iserver/secdef/info -> option conid
+//           const info = await ibFetch(`/iserver/secdef/info?conid=${conidUL}&sectype=OPT&month=${month}&exchange=SMART&right=${o.right}&strike=${o.strike}`);
+//           const arr = Array.isArray(info) ? info
+//                     : Array.isArray(info?.Contracts) ? info.Contracts
+//                     : (info ? [info] : []);
+//           const optConid = arr.find(x=>x?.conid)?.conid;
+//           if (!optConid) continue;
+
+//           const snap = await ibFetch(`/iserver/marketdata/snapshot?conids=${optConid}&fields=31,84,86`);
+//           const s0   = Array.isArray(snap)&&snap[0] ? snap[0] : {};
+//           ticks.push(mapOptionTick(o.underlying, o.expiration, o.strike, o.right, s0));
+//         } catch (e) {
+//           // ignore per-option errors
+//         }
+//       }
+//     } else {
+//       // lightweight sampler: one ATM C/P for each UL
+//       for (const ul of underlyings){
+//         try {
+//           const conidUL = await ibConidForStock(ul);
+//           if (!conidUL) continue;
+
+//           // underlying last
+//           const snapUL = await ibFetch(`/iserver/marketdata/snapshot?conids=${conidUL}&fields=31`);
+//           const s0     = Array.isArray(snapUL)&&snapUL[0] ? snapUL[0] : {};
+//           const ulLast = Number(s0?.["31"]);
+//           if (!Number.isFinite(ulLast)) continue;
+
+//           const expiries = await ibOptMonthsForSymbol(ul);
+//           if (!expiries.length) continue;
+//           const expiry = expiries[0]; // nearest monthly
+//           const grid   = ulLast < 50 ? 1 : 5;
+//           const strike = Math.round(ulLast / grid) * grid;
+//           const month  = expiry.replaceAll("-","").slice(0,6);
+
+//           for (const right of ["C","P"]){
+//             try {
+//               const info = await ibFetch(`/iserver/secdef/info?conid=${conidUL}&sectype=OPT&month=${month}&exchange=SMART&right=${right}&strike=${strike}`);
+//               const arr = Array.isArray(info) ? info
+//                         : Array.isArray(info?.Contracts) ? info.Contracts
+//                         : (info ? [info] : []);
+//               const optConid = arr.find(x=>x?.conid)?.conid;
+//               if (!optConid) continue;
+
+//               const snap = await ibFetch(`/iserver/marketdata/snapshot?conids=${optConid}&fields=31,84,86`);
+//               const s1   = Array.isArray(snap)&&snap[0] ? snap[0] : {};
+//               ticks.push(mapOptionTick(ul, expiry, strike, right, s1));
+//             } catch {}
+//           }
+//         } catch {}
+//       }
+//     }
+
+//     if (ticks.length){
+//       STATE.options_ts = ticks;
+//       wsBroadcast("options_ts", ticks);
+//     }
+//   } catch (e) {
+//     console.warn("pollOptionsOnce:", e.message);
+//   }
+// }
+
+// --- fetch() for Node < 18 (safe no-op if already present) ---
+if (typeof fetch === "undefined") {
+  global.fetch = (await import("node-fetch")).default;
+}
+
+// --- tiny JSON fetch helper used by pollers ---
+async function ibFetchJson(url, init) {
+  const r = await fetch(url, init);
+  if (!r.ok) {
+    const body = await r.text().catch(() => "");
+    throw new Error(`IB ${r.status} ${url} :: ${body || "null"}`);
+  }
+  try { return await r.json(); } catch { return {}; }
+}
+
+// --- resolve stock conid (low-rate endpoint) ---
+// async function ibConidForStock(symbol) {
+//   const url = `${IB_BASE}/trsrv/stocks?symbols=${encodeURIComponent(symbol)}`;
+//   const j = await ibFetchJson(url);
+//   return j?.[symbol]?.[0]?.conid;
+// }
+
+// --- list usable expirations (you already had a working debug/expirations; reuse that logic if you prefer) ---
+async function ibOptMonthsForSymbol(symbol) {
+  // use your existing working path: /iserver/secdef/search and read "sections[].months"
+  const url = `${IB_BASE}/iserver/secdef/search?symbol=${encodeURIComponent(symbol)}&sectype=OPT&exchange=SMART`;
+  const arr = await ibFetchJson(url);
+  const hit = (Array.isArray(arr) ? arr : []).find(x => x?.symbol === symbol);
+  const months = hit?.sections?.find(s => s?.secType === "OPT")?.months || "";
+  // months come like "NOV25;DEC25;JAN26;..." – convert to yyyy-mm roughly; or just
+  // fallback to your existing /debug/expirations implementation if you have it.
+  // For now we’ll just return month codes; pollOptionsOnce only needs yyyy-mm; if you already
+  // have a working expirations function, call that instead.
+  // If you DO have a function that returns full yyyy-mm-dd monthlies, prefer that.
+  return months.split(";").slice(0, 2).map(m => {
+    // crude normalize: e.g. "NOV25" -> "2025-11-21" (OPM 3rd Friday). Use your real function if you have it.
+    const MMM = m.slice(0,3).toUpperCase();
+    const YY = 2000 + Number(m.slice(3));
+    const mm = {JAN:"01",FEB:"02",MAR:"03",APR:"04",MAY:"05",JUN:"06",JUL:"07",AUG:"08",SEP:"09",OCT:"10",NOV:"11",DEC:"12"}[MMM];
+    // third Friday approximation (21 is fine as a proxy for visuals/off-hours)
+    return `${YY}-${mm}-21`;
+  });
+}
+
+// --- converters used by your UI feeds ---
+function mapEquitySnapshot(sym, s) {
+  return {
+    symbol: sym,
+    last: num(s["31"]),
+    bid:  num(s["84"]),
+    ask:  num(s["86"]),
+    iv:   num(s["7059"]),
+    ts:   Date.now(),
+  };
+}
+function mapOptionTick(ul, expiration, strike, right, s0) {
+  return {
+    underlying: ul,
+    expiration,
+    strike,
+    right,
+    last: num(s0["31"]),
+    bid:  num(s0["84"]),
+    ask:  num(s0["86"]),
+    ts:   Date.now(),
+  };
+}
+const num = (x) => (x == null ? undefined : Number(x));
+
+async function pollOptionsOnce() {
   try {
-    const explicit = normOptions(WATCH);
-    const underlyings = normEquities(WATCH);
+    // 1) union of ULs from equities + options watchlist
+    const ulSet = new Set(normEquities(WATCH).map(s => s.toUpperCase()));
+    for (const o of normOptions(WATCH)) if (o?.underlying) ulSet.add(String(o.underlying).toUpperCase());
+    const underlyings = Array.from(ulSet);
+    if (!underlyings.length) return;
 
     const ticks = [];
 
-    if (explicit.length){
-      for (const o of explicit){
-        try {
-          const conidUL = await ibConidForStock(o.underlying);
-          if (!conidUL) continue;
+    for (const ul of underlyings) {
+      // Resolve UL conid + last price
+      const conid = await ibConidForStock(ul);
+      if (!conid) continue;
 
-          // month=YYYYMM
-          const month = o.expiration.replaceAll("-","").slice(0,6);
-          // /iserver/secdef/info -> option conid
-          const info = await ibFetch(`/iserver/secdef/info?conid=${conidUL}&sectype=OPT&month=${month}&exchange=SMART&right=${o.right}&strike=${o.strike}`);
-          const arr = Array.isArray(info) ? info
-                    : Array.isArray(info?.Contracts) ? info.Contracts
-                    : (info ? [info] : []);
-          const optConid = arr.find(x=>x?.conid)?.conid;
-          if (!optConid) continue;
+      const snap = await ibFetchJson(`${IB_BASE}/iserver/marketdata/snapshot?conids=${conid}&fields=31`);
+      const underPx = Number((Array.isArray(snap) && snap[0] && snap[0]["31"]) ?? NaN);
+      if (!Number.isFinite(underPx)) continue;
 
-          const snap = await ibFetch(`/iserver/marketdata/snapshot?conids=${optConid}&fields=31,84,86`);
-          const s0   = Array.isArray(snap)&&snap[0] ? snap[0] : {};
-          ticks.push(mapOptionTick(o.underlying, o.expiration, o.strike, o.right, s0));
-        } catch (e) {
-          // ignore per-option errors
-        }
-      }
-    } else {
-      // lightweight sampler: one ATM C/P for each UL
-      for (const ul of underlyings){
-        try {
-          const conidUL = await ibConidForStock(ul);
-          if (!conidUL) continue;
+      // 2) choose expiries: nearest 2 monthlies (fallback to first 2 returned)
+      let expiries = await ibOptMonthsForSymbol(ul);
+      expiries = (expiries || []).slice(0, 2); // keep it light to avoid 429
 
-          // underlying last
-          const snapUL = await ibFetch(`/iserver/marketdata/snapshot?conids=${conidUL}&fields=31`);
-          const s0     = Array.isArray(snapUL)&&snapUL[0] ? snapUL[0] : {};
-          const ulLast = Number(s0?.["31"]);
-          if (!Number.isFinite(ulLast)) continue;
+      // 3) choose strikes around ATM (grid 1 or 5)
+      const grid = underPx < 50 ? 1 : 5;
+      const atm = Math.round(underPx / grid) * grid;
+      const rel = [-2,-1,0,1,2].map(i => atm + i * grid);
 
-          const expiries = await ibOptMonthsForSymbol(ul);
-          if (!expiries.length) continue;
-          const expiry = expiries[0]; // nearest monthly
-          const grid   = ulLast < 50 ? 1 : 5;
-          const strike = Math.round(ulLast / grid) * grid;
-          const month  = expiry.replaceAll("-","").slice(0,6);
+      for (const expiry of expiries) {
+        const yyyy = expiry.slice(0, 4);
+        const mm   = expiry.slice(5, 7);
+        const month = `${yyyy}${mm}`;
 
-          for (const right of ["C","P"]){
+        for (const right of ["C", "P"]) {
+          for (const strike of rel) {
             try {
-              const info = await ibFetch(`/iserver/secdef/info?conid=${conidUL}&sectype=OPT&month=${month}&exchange=SMART&right=${right}&strike=${strike}`);
+              const infoUrl = `${IB_BASE}/iserver/secdef/info?conid=${conid}&sectype=OPT&month=${month}&exchange=SMART&right=${right}&strike=${strike}`;
+              const info = await ibFetchJson(infoUrl);
               const arr = Array.isArray(info) ? info
                         : Array.isArray(info?.Contracts) ? info.Contracts
                         : (info ? [info] : []);
-              const optConid = arr.find(x=>x?.conid)?.conid;
+              const optConid = arr.find(x => x?.conid)?.conid;
               if (!optConid) continue;
 
-              const snap = await ibFetch(`/iserver/marketdata/snapshot?conids=${optConid}&fields=31,84,86`);
-              const s1   = Array.isArray(snap)&&snap[0] ? snap[0] : {};
-              ticks.push(mapOptionTick(ul, expiry, strike, right, s1));
-            } catch {}
+              const osnap = await ibFetchJson(`${IB_BASE}/iserver/marketdata/snapshot?conids=${optConid}&fields=31,84,86`);
+              const s0 = Array.isArray(osnap) && osnap[0] ? osnap[0] : {};
+              const tick = mapOptionTick(ul, expiry, strike, right, s0);
+              ticks.push(tick);
+            } catch {/* ignore individual misses */}
           }
-        } catch {}
+        }
       }
     }
 
-    if (ticks.length){
-      STATE.options_ts = ticks;
-      wsBroadcast("options_ts", ticks);
-    }
+    // Always publish (even if empty) so UI knows we polled
+    STATE.options_ts = ticks;
+    wsBroadcast("options_ts", ticks);
   } catch (e) {
-    console.warn("pollOptionsOnce:", e.message);
+    console.warn("pollOptionsOnce error:", e.message);
   }
 }
+
 
 /* ================= SCHEDULERS =================
    - Keep intervals modest to avoid 429
@@ -540,7 +822,8 @@ async function pollOptionsOnce(){
 ================================================ */
 setInterval(pollEquitiesOnce, 10_000); // 10s
 setInterval(pollOptionsOnce, 13_000);  // 13s (desync)
-
+//setInterval(pollSweepsOnce, 3_000); // or whatever cadence you want
+//setInterval(pollBlocksOnce, 3_000);
 /* ================= ROUTES ================= */
 app.get("/", (req,res)=>res.type("text/plain").send("TradeFlash server up\n"));
 
@@ -613,7 +896,11 @@ app.get("/health", (req,res)=>{
 });
 
 /* ================= START ================= */
-server.listen(PORT, ()=>console.log(`Listening on http://localhost:${PORT}`));
+// server.listen(PORT, ()=>console.log(`Listening on http://localhost:${PORT}`));
+server.listen(PORT, async () => {
+  console.log(`Listening on http://localhost:${PORT}`);
+  await seedDefaultsOnce();   // <— seed at boot
+});
 
 /* ============ QUICK CURLS =============
 # seed watch
