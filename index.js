@@ -15,6 +15,17 @@ import fs from "fs";
 
 import { router as watchlistRouter } from "./routes/watchlist.js";
 
+const ALIASES = new Map([
+  ["$SPX", "SPX"],
+  ["^GSPC", "SPX"],
+  ["/ES", "ES"],
+  ["ES1!", "ES"],   // TradingView style
+]);
+function canon(sym) {
+  const s = String(sym||"").trim().toUpperCase();
+  return ALIASES.get(s) || s;
+}
+
 /* ================= CONFIG ================= */
 const PORT    = Number(process.env.PORT || 8080);
 const IB_BASE = String(process.env.IB_BASE || "https://127.0.0.1:5000/v1/api").replace(/\/+$/,"");
@@ -434,13 +445,74 @@ function normOptions(W){
   })).filter(o=>o.underlying && o.right && Number.isFinite(o.strike));
 }
 function getWatchlist(){ return { equities: normEquities(WATCH), options: normOptions(WATCH) }; }
+// async function watchAddEquities(eqs=[]){
+//   const before = normEquities(WATCH).length;
+//   for (const s of eqs) { const u=String(s).toUpperCase(); if (u) WATCH.equities.add(u); }
+//   const after = normEquities(WATCH).length;
+//   if (after>before) wsBroadcast("watchlist", getWatchlist());
+//   return Math.max(0, after-before);
+// }
 async function watchAddEquities(eqs=[]){
   const before = normEquities(WATCH).length;
-  for (const s of eqs) { const u=String(s).toUpperCase(); if (u) WATCH.equities.add(u); }
+  for (const s of eqs) { const u = canon(s); if (u) WATCH.equities.add(u); }
   const after = normEquities(WATCH).length;
   if (after>before) wsBroadcast("watchlist", getWatchlist());
   return Math.max(0, after-before);
 }
+async function ibConidForSymbol(sym){
+  if (!isNonEmptyStr(sym)) return null;
+  const key = canon(sym);
+
+  // cache hit?
+  const cached = CACHE.conidBySym.get(key);
+  if (cached && cached.ts && (Date.now()-cached.ts) < CONID_TTL_MS) return cached.conid;
+
+  // MOCK mode quick map
+  if (MOCK){
+    const demo = { AAPL:"265598", NVDA:"4815747", MSFT:"272093", SPY:"756733", SPX:"416904", ES:"123456" };
+    const c = demo[key] || String(100000+Math.floor(Math.random()*9e5));
+    CACHE.conidBySym.set(key, { conid:c, ts:Date.now() });
+    return c;
+  }
+
+  // search once
+  let best = null;
+  try {
+    const body = await ibFetch(`/iserver/secdef/search?symbol=${encodeURIComponent(key)}`);
+    const list = Array.isArray(body) ? body : (body ? [body] : []);
+
+    // prefer STK, then IND, then FUT
+    const pick = (secType) =>
+      list.find(r => String(r?.symbol||"").toUpperCase()===key &&
+                     (r?.sections||[]).some(s=>s?.secType===secType) && r?.conid);
+
+    best = pick("STK") || pick("IND") || pick("FUT") || list.find(r => r?.conid);
+  } catch {}
+
+  // FUT (ES): choose a front contract if choices exist
+  if (best && (best.sections||[]).some(s=>s.secType==="FUT")) {
+    // some responses include Contracts array; pick nearest expiry
+    try {
+      const info = await ibFetch(`/iserver/secdef/info?conid=${best.conid}`);
+      const contracts = info?.Contracts || info || [];
+      if (Array.isArray(contracts) && contracts.length) {
+        const now = Date.now();
+        contracts.sort((a,b)=>{
+          const ta = Date.parse(a?.expiry || a?.maturity || "2100-01-01");
+          const tb = Date.parse(b?.expiry || b?.maturity || "2100-01-01");
+          return Math.abs(ta-now) - Math.abs(tb-now);
+        });
+        const fut = contracts.find(c=>c?.conid) || contracts[0];
+        if (fut?.conid) best = { ...best, conid: String(fut.conid) };
+      }
+    } catch {}
+  }
+
+  const conid = best?.conid ? String(best.conid) : null;
+  if (conid) CACHE.conidBySym.set(key, { conid, ts:Date.now() });
+  return conid;
+}
+
 async function watchAddOptions(options=[]){
   if (!Array.isArray(WATCH.options)) WATCH.options=[];
   const before = normOptions(WATCH).length;
@@ -596,21 +668,18 @@ app.get("/debug/conid", async (req,res)=>{
   try{
     const symbol = String(req.query.symbol||"").toUpperCase();
     if (!symbol) return res.status(400).json({ error:"symbol required" });
-    const conid = await ibConidForStock(symbol);
+    const conid = await ibConidForSymbol(symbol);
     if (!conid) return res.status(404).json({ error:`No conid for ${symbol}` });
     res.json({ symbol, conid:String(conid) });
   }catch(e){ res.status(500).json({ error:e.message }); }
 });
-
 async function ibOptMonthsForSymbol(sym){
-  const key = sym.toUpperCase();
+  const key = canon(sym);
   const hit = CACHE.expBySym.get(key);
   if (hit && (Date.now()-hit.ts) < EXP_TTL_MS) return hit.expirations;
 
   if (MOCK){
-    const exps = [
-      "2025-11-21", "2025-12-21", "2026-01-16", "2026-02-20"
-    ];
+    const exps = [ "2025-11-21","2025-12-19","2026-01-16" ];
     CACHE.expBySym.set(key, { ts:Date.now(), expirations:exps });
     return exps;
   }
@@ -624,6 +693,29 @@ async function ibOptMonthsForSymbol(sym){
   CACHE.expBySym.set(key, { ts:Date.now(), expirations:exps });
   return exps;
 }
+
+// async function ibOptMonthsForSymbol(sym){
+//   const key = sym.toUpperCase();
+//   const hit = CACHE.expBySym.get(key);
+//   if (hit && (Date.now()-hit.ts) < EXP_TTL_MS) return hit.expirations;
+
+//   if (MOCK){
+//     const exps = [
+//       "2025-11-21", "2025-12-21", "2026-01-16", "2026-02-20"
+//     ];
+//     CACHE.expBySym.set(key, { ts:Date.now(), expirations:exps });
+//     return exps;
+//   }
+
+//   const body = await ibFetch(`/iserver/secdef/search?symbol=${encodeURIComponent(key)}`);
+//   const list = Array.isArray(body) ? body : (body ? [body] : []);
+//   const rec  = list.find(x => String(x?.symbol||"").toUpperCase()===key) || list[0];
+//   const optSec = (rec?.sections||[]).find(s => s?.secType==="OPT");
+//   const tokens = optSec?.months || "";
+//   const exps = monthsTokensToThirdFridays(tokens);
+//   CACHE.expBySym.set(key, { ts:Date.now(), expirations:exps });
+//   return exps;
+// }
 
 /* ================= MAPPERS ================= */
 function mapEquitySnapshot(sym, s){
@@ -648,7 +740,7 @@ async function pollEquitiesOnce(){
 
     const pairs = [];
     for (const sym of symbols){
-      try { const conid = await ibConidForStock(sym); if (conid) pairs.push({ sym, conid }); }
+      try { const conid = await ibConidForSymbol(sym); if (conid) pairs.push({ sym, conid }); }
       catch {}
     }
     if (!pairs.length) return;
@@ -735,7 +827,7 @@ async function pollOptionsOnce(){
 
     const ticks = [];
     for (const ul of underlyings){
-      const conid = await ibConidForStock(ul); if (!conid) continue;
+      const conid = await ibConidForSymbol(ul); if (!conid) continue;
 
       const snap = MOCK
         ? [{ "31": 100+Math.random()*50 }]
@@ -1155,7 +1247,7 @@ app.get("/api/flow/chains", async (req,res)=>{
     if (!syms.length) return res.json([]);
     const out=[];
     for (const sym of syms){
-      const conid = await ibConidForStock(sym);
+      const conid = await ibConidForSymbol(sym);
       if (!conid) continue;
       const expirations = await ibOptMonthsForSymbol(sym);
       out.push({ symbol:sym, conid, expirations });
@@ -1172,7 +1264,7 @@ app.get("/debug/expirations", async (req,res)=>{
   try {
     const symbol = String(req.query.symbol||"").toUpperCase();
     if (!symbol) return res.status(400).json({ error:"symbol required" });
-    const conid = await ibConidForStock(symbol);
+    const conid = await ibConidForSymbol(symbol);
     if (!conid) return res.status(500).json({ error:`No conid for ${symbol}` });
     const expirations = await ibOptMonthsForSymbol(symbol);
     res.json({ symbol, conid, expirations });
