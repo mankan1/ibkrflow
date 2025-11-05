@@ -187,11 +187,12 @@ if (!STATE.watchlist) STATE.watchlist = { equities: [], options: [] };
 //   .map(s => s.trim().toUpperCase())
 //   .filter(Boolean);
 const POPULAR_50 = [
-  "SPY","QQQ","IWM","DIA","TLT","HYG","GLD","SLV","GDX","USO","SPX","ES",
-  "AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA","AVGO","AMD","NFLX","SMCI","MU","TSM","INTC","CSCO","IBM","ORCL","CRM",
-  "JPM","BAC","WFC","MS","GS","V","MA","PYPL","SQ","COIN",
-  "XOM","CVX","COP","OXY",
-  "UNH","JNJ","MRK","PFE","COST","HD","DIS"
+  "SPY","QQQ","IWM","DIA","SPX","ES"
+  // ,"TLT","HYG","GLD","SLV","GDX","USO",
+  // "AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA","AVGO","AMD","NFLX","SMCI","MU","TSM","INTC","CSCO","IBM","ORCL","CRM",
+  // "JPM","BAC","WFC","MS","GS","V","MA","PYPL","SQ","COIN",
+  // "XOM","CVX","COP","OXY",
+  // "UNH","JNJ","MRK","PFE","COST","HD","DIS"
 ];
 
 const SEED_ON_EMPTY = String(process.env.SEED_ON_EMPTY || "").trim() === "1";

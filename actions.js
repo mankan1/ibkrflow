@@ -115,7 +115,7 @@ export const oiHistByOcc  = new Map();   // occ -> [{ ymd, oi } ... up to N]
 // ===== configurable thresholds =====
 const TH_CLOSE_BY_DVOL   = 0.80; // ≥80% of *opening* OI already traded → close bias
 const TH_BIG_TRADE_OI    = 1.05; // qty > 105% of remaining opening OI → must OPEN
-const LOOKBACK_OI_DAYS   = 3;    // recent OI trend window
+const LOOKBACK_OI_DAYS   = 15;    // recent OI trend window
 const TH_TREND_UP_FACTOR = 1.10; // last OI vs first OI in window must be +10%
 const MIN_OPENING_OI     = 20;   // ignore micro OI when biasing
 
