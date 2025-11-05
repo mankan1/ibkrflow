@@ -2018,63 +2018,123 @@ function enrichWithAction(msg) {
   return Object.assign(msg, inf);
 }
 
-// ===================== NEW pushAndFanout =====================
+function headlineOfTrade(t /* print|sweep|block */) {
+  const right = t.right || t.option?.right;      // "C" | "P" | "CALL" | "PUT"
+  const strike = t.strike ?? t.option?.strike;
+  const expiry = t.expiry ?? t.option?.expiration;
+  const side = (t.side || "UNKNOWN").toUpperCase();
+
+  return {
+    type: (t.type || "PRINT").toUpperCase(),     // "PRINT" | "SWEEP" | "BLOCK"
+    ul: t.ul || t.symbol || "",
+    right,
+    strike,
+    expiry,
+    side,
+    notional: Math.round((t.notional ?? (t.qty||0)*(t.price||0)*100) || 0),
+    ts: Number(t.ts) || Date.now(),
+
+    // 🔹 carry through enrichment so the badge can render
+    action: t.action,             // "BTO" | "BTC" | "STO" | "STC" | ...
+    action_conf: t.action_conf,   // "high" | "medium" | "low"
+    at: t.at                      // "bid" | "ask" | "mid" | "between"
+  };
+}
 function pushAndFanout(msg) {
   try {
-    // Enrich (prints, sweeps, blocks, notables) with BTO/BTC/STO/STC, at, oi, priorVol, reason
-    if (msg && (msg.type === "print" || msg.type === "sweeps" || msg.type === "blocks" || msg.type === "notables")) {
-      msg = enrichWithAction(msg);
+    // ensure enrichment exists once (prints, sweeps, blocks)
+    if (!msg.action) {
+      const occ = toOcc(msg.symbol, msg?.option?.expiration, msg?.option?.right, msg?.option?.strike);
+      const bid = Number(msg?.nbbo?.bid), ask = Number(msg?.nbbo?.ask);
+      const mid = (Number.isFinite(bid) && Number.isFinite(ask) && bid>0 && ask>0) ? (bid+ask)/2 : undefined;
+      const inf = inferActionForOptionTrade({
+        occ,
+        qty: Number(msg.qty) || 0,
+        price: Number(msg.price) || 0,
+        side: String(msg.side || "UNKNOWN"),
+        book: { bid, ask, mid },
+        cumulativeVol: msg.cumulativeVol,   // if known, else undefined
+        oi: msg.oi,                         // if known, else undefined
+        asOfYMD: etYMD()
+      });
+      Object.assign(msg, inf); // adds action, action_conf, at, priorVol, oi, reason
     }
+  } catch (_) {}
 
-    // Also enrich headlines if they carry an option leg (so chips can show action)
-    if (msg && msg.type === "headlines") {
-      // single headline object or array? Support both
-      const batch = Array.isArray(msg.data) ? msg.data : [msg];
-      for (const h of batch) enrichWithAction(h);
-    }
-  } catch (e) {
-    // swallow — we still want to fanout raw messages if inference fails
-  }
-
-  // Route by topic
+  // keep your existing topic handling
   if (msg?.type === "sweeps") {
-    STATE.sweeps = [...(STATE.sweeps || []), msg].slice(-500);
-    wsBroadcast("sweeps", STATE.sweeps);
-    return;
-  }
-
-  if (msg?.type === "blocks") {
-    STATE.blocks = [...(STATE.blocks || []), msg].slice(-500);
-    wsBroadcast("blocks", STATE.blocks);
-    return;
-  }
-
-  if (msg?.type === "notables") {
-    STATE.notables = [...(STATE.notables || []), msg].slice(-500);
-    wsBroadcast("notables", STATE.notables);
-    return;
-  }
-
-  if (msg?.type === "print") {
+    STATE.sweeps = [...(STATE.sweeps || []), msg];
+    wsBroadcast("sweeps", STATE.sweeps.slice(-500));
+  } else if (msg?.type === "blocks") {
+    STATE.blocks = [...(STATE.blocks || []), msg];
+    wsBroadcast("blocks", STATE.blocks.slice(-500));
+  } else if (msg?.type === "print") {
     STATE.prints = [...(STATE.prints || []), msg].slice(-2000);
-    // small, frequent pushes; clients can aggregate
-    wsBroadcast("prints", [msg]);
-    return;
+    wsBroadcast("prints", [msg]); // light push for clients
   }
 
-  if (msg?.type === "headlines") {
-    // If you publish headlines as a batch: ensure items already enriched
-    // Attach only the top-N or pass through
-    const arr = Array.isArray(msg.data) ? msg.data : [msg];
-    wsBroadcast("headlines", arr);
-    return;
-  }
-
-  // Fallback passthrough (if some future type shows up)
-  if (msg?.topic && msg?.data !== undefined) {
-    wsBroadcast(msg.topic, msg.data);
-  }
+  // 🔹 NEW: always publish an enriched headline for *any* trade
+  const h = headlineOfTrade(msg);
+  wsBroadcast("headlines", [h]);
 }
+
+// ===================== NEW pushAndFanout =====================
+// function pushAndFanout(msg) {
+//   try {
+//     // Enrich (prints, sweeps, blocks, notables) with BTO/BTC/STO/STC, at, oi, priorVol, reason
+//     if (msg && (msg.type === "print" || msg.type === "sweeps" || msg.type === "blocks" || msg.type === "notables")) {
+//       msg = enrichWithAction(msg);
+//     }
+
+//     // Also enrich headlines if they carry an option leg (so chips can show action)
+//     if (msg && msg.type === "headlines") {
+//       // single headline object or array? Support both
+//       const batch = Array.isArray(msg.data) ? msg.data : [msg];
+//       for (const h of batch) enrichWithAction(h);
+//     }
+//   } catch (e) {
+//     // swallow — we still want to fanout raw messages if inference fails
+//   }
+
+//   // Route by topic
+//   if (msg?.type === "sweeps") {
+//     STATE.sweeps = [...(STATE.sweeps || []), msg].slice(-500);
+//     wsBroadcast("sweeps", STATE.sweeps);
+//     return;
+//   }
+
+//   if (msg?.type === "blocks") {
+//     STATE.blocks = [...(STATE.blocks || []), msg].slice(-500);
+//     wsBroadcast("blocks", STATE.blocks);
+//     return;
+//   }
+
+//   if (msg?.type === "notables") {
+//     STATE.notables = [...(STATE.notables || []), msg].slice(-500);
+//     wsBroadcast("notables", STATE.notables);
+//     return;
+//   }
+
+//   if (msg?.type === "print") {
+//     STATE.prints = [...(STATE.prints || []), msg].slice(-2000);
+//     // small, frequent pushes; clients can aggregate
+//     wsBroadcast("prints", [msg]);
+//     return;
+//   }
+
+//   if (msg?.type === "headlines") {
+//     // If you publish headlines as a batch: ensure items already enriched
+//     // Attach only the top-N or pass through
+//     const arr = Array.isArray(msg.data) ? msg.data : [msg];
+//     wsBroadcast("headlines", arr);
+//     return;
+//   }
+
+//   // Fallback passthrough (if some future type shows up)
+//   if (msg?.topic && msg?.data !== undefined) {
+//     wsBroadcast(msg.topic, msg.data);
+//   }
+// }
 function toNum(x){ const n = Number(x); return Number.isFinite(n) ? n : null; }
 
 function normalizeQuoteFields(raw){
