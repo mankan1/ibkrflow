@@ -60,6 +60,11 @@ const STATE = {
   blocks:      [],                     // UI shape for Blocks screen
   prints:      [],   // <— add this
 };
+const latestUL = new Map(); // "NVDA" -> 196.95
+
+// ===== Option quotes buffer (debounced) -> pushes topic: option_quotes
+const optionQuoteBuf = new Map(); // occ -> { occ, bid, ask, mid, ts }
+const OPTION_QUOTES_FLUSH_MS = 500;
 
 const CACHE = {
   conidBySym: new Map(),               // key: "AAPL" -> { conid, ts }
@@ -366,6 +371,130 @@ let lastReqEndedAt = 0;
 let wss = /** @type {import('ws').WebSocketServer|null} */ (null);
 let wsReady = false;
 const WS_QUEUE = []; // payloads buffered until WS is ready
+
+// Dedup + burst-friendly broadcast
+function flushOptionQuotes() {
+  if (!optionQuoteBuf.size) return;
+  const data = Array.from(optionQuoteBuf.values());
+  optionQuoteBuf.clear();
+  wsBroadcast({ topic: "option_quotes", data });
+}
+setInterval(flushOptionQuotes, OPTION_QUOTES_FLUSH_MS);
+
+// Ingest a single live option quote (from your vendor handlers)
+function ingestOptionQuote({ occ, bid, ask, mid, ts }) {
+  if (!occ) return;
+  const m = Number.isFinite(+bid) && Number.isFinite(+ask) ? (Number(bid)+Number(ask))/2 : Number(mid);
+  optionQuoteBuf.set(occ, {
+    occ,
+    bid: Number.isFinite(+bid) ? Number(bid) : undefined,
+    ask: Number.isFinite(+ask) ? Number(ask) : undefined,
+    mid: Number.isFinite(+m)   ? Number(m)   : undefined,
+    ts: ts || Date.now()
+  });
+}
+
+// UL last seeding
+function seedUL(symbol, price) {
+  if (!symbol) return;
+  const s = String(symbol).toUpperCase();
+  if (Number.isFinite(+price)) latestUL.set(s, Number(price));
+}
+
+// yyyymmdd (UTC is fine for display; use ET if you prefer)
+function asOfYMD(d = new Date()) {
+  return d.toISOString().slice(0,10).replace(/-/g,"");
+}
+
+// OCC builder if your feed doesn’t give one
+function occFromParts(ul, expiry, right, strike) {
+  if (!ul || !expiry || !right || !Number.isFinite(+strike)) return null;
+  const root = (ul + "      ").slice(0, 6);
+  const yymmdd = String(expiry).replace(/-/g, "").slice(2, 8);
+  const cp = String(right).toUpperCase().startsWith("C") ? "C" : "P";
+  const k = String(Math.round(Number(strike) * 1000)).padStart(8, "0");
+  return `${root}${yymmdd}${cp}${k}`;
+}
+
+function num(v) { const n = Number(v); return Number.isFinite(n) ? n : undefined; }
+function normUL(x) { return String(x || "").trim().toUpperCase(); }
+// Convert provider trade → normalized object with at/action/mark fields
+function normalizeOptionTrade(raw) {
+  const ul     = normUL(raw.ul || raw.underlying || raw.ul_symbol || raw.symbol || raw.root || raw.underlyingSymbol);
+  const rightR = String(raw.right || raw.r || "").toUpperCase();
+  const sideR  = String(raw.side  || raw.action || "").toUpperCase();
+  const strike = num(raw.strike ?? raw.k);
+  const expiry = String(raw.expiry ?? raw.expiration ?? raw.exp ?? "");
+  const qty    = num(raw.qty ?? raw.size ?? raw.quantity) || 0;
+  const price  = num(raw.price ?? raw.px ?? raw.last ?? raw.trade_price ?? raw.bid ?? raw.ask) || 0;
+
+  // book
+  const bid = num(raw.bid);
+  const ask = num(raw.ask);
+  const mid = Number.isFinite(bid) && Number.isFinite(ask) ? (bid + ask) / 2 : num(raw.mid);
+
+  // compute 'at' and inference
+  const occ = raw.occ || occFromParts(ul, expiry, rightR, strike);
+  const info = inferActionForOptionTrade({
+    occ,
+    qty,
+    price,
+    side: sideR,                              // BUY/SELL expected
+    book: { bid, ask, mid },
+    cumulativeVol: num(raw.volume ?? raw.day_volume), // if your feed sends cumulative day volume
+    oi: num(raw.oi),
+    asOfYMD: asOfYMD()
+  });
+
+  const right = (rightR === "C" || rightR === "CALL") ? "CALL" : "PUT";
+
+  // UL price at trade time (if given), else last known
+  const ul_px = num(raw.ul_px ?? raw.underlyingPrice ?? raw.underlying_last);
+  if (ul && Number.isFinite(ul_px)) seedUL(ul, ul_px);
+
+  // If you’re also receiving live UL quotes elsewhere, remember to seedUL there too.
+
+  return {
+    ul,
+    right,
+    strike,
+    expiry,
+    side: (sideR === "BUY" || sideR === "B") ? "BUY" : (sideR === "SELL" || sideR === "S") ? "SELL" : "UNKNOWN",
+    qty,
+    price,
+    notional: Math.round(qty * price * 100),
+    prints: num(raw.prints ?? raw.parts) || 1,
+    ts: num(raw.ts ?? raw.time) || Date.now(),
+
+    occ,
+    bid, ask, mid,
+    at: info.at,                   // "bid" | "ask" | "mid" | "between"
+    action: info.action,           // "BTO" | "BTC" | "STO" | "STC" | ...
+    action_conf: info.action_conf, // "high" | "medium" | "low"
+    reason: info.reason,
+
+    oi: num(raw.oi) ?? null,
+    priorVol: info.priorVol ?? null,
+    volume: num(raw.volume ?? raw.day_volume) ?? null,
+    ul_px: Number.isFinite(ul_px) ? ul_px : (ul ? latestUL.get(ul) : undefined)
+  };
+}
+function publishFlow(topic, rawRows) {
+  const rows = (Array.isArray(rawRows) ? rawRows : [rawRows]).map(normalizeOptionTrade);
+
+  // seed UL map from payloads & attach a small ul_prices map so clients can backfill
+  const ul_prices = {};
+  for (const r of rows) {
+    if (r.ul && Number.isFinite(r.ul_px)) ul_prices[r.ul] = r.ul_px;
+    else if (r.ul && latestUL.has(r.ul))  ul_prices[r.ul] = latestUL.get(r.ul);
+  }
+  wsBroadcast({ topic, data: rows, ul_prices });
+}
+
+// convenience wrappers
+export function publishBlocks(rawRows) { publishFlow("blocks", rawRows); }
+export function publishSweeps(rawRows) { publishFlow("sweeps", rawRows); }
+export function publishPrints(rawRows) { publishFlow("prints", rawRows); }
 
 function wsSend(ws, topic, data) {
   try { ws.send(JSON.stringify({ topic, data })); } catch {}
@@ -852,6 +981,36 @@ function etYMD() {
   const d = p.find(x => x.type==="day")?.value;
   return `${y}${m}${d}`;
 }
+
+function refreshBlocks() {
+  const rows = computeBlocks(9999, 50_000)
+    .filter(passesPublishGate)
+    .slice(0, 50)
+    .map(r => ({ ...r, ul_px: (getUnderlyingLastNear(r.ul, r.ts) ?? getLast(r.ul) ?? null) }))
+    .map(withMark);
+
+  publishBlocks(rows); // 🔔 push to subscribers
+}
+
+function refreshSweeps() {
+  const rows = computeSweeps(9999, 25_000)
+    .filter(passesPublishGate)
+    .slice(0, 200)
+    .map(r => attachDayStats({
+      ...r,
+      ul_px: (getUnderlyingLastNear(r.ul, r.ts) ?? getLast(r.ul) ?? null)
+    }))
+    .map(withMark);
+
+  publishSweeps(rows); // 🔔 push to subscribers
+}
+
+// run on an interval or after each NBBO/tape update
+setInterval(() => {
+  refreshBlocks();
+  refreshSweeps();
+}, 5_000);
+
 setInterval(() => {
   const ymd = etYMD();
   if (ymd !== lastETDay) {
@@ -1075,7 +1234,7 @@ async function pollBlocksOnce(){ try {
 // }
 
 // const isNonEmptyStr=(s)=>typeof s==="string" && s.trim().length>0;
-const num=(x)=> (x==null ? undefined : Number(x));
+// const num=(x)=> (x==null ? undefined : Number(x));
 
 function rightNormalize(x){
   const s = String(x||"").trim().toUpperCase();
@@ -1926,28 +2085,124 @@ async function pollEquitiesOnce(){
 // };
 
 
+// function withMark(row){
+//   const occ = toOcc(row.ul, row.expiry, rightToCP(row.right), row.strike);
+//   const q = NBBO_OPT.get(occ);
+//   const mark = (q && q.bid>0 && q.ask>0) ? (q.bid+q.ask)/2 : undefined;
+//   return { ...row, mark };
+// }
+
+// Safer helpers in case right is already "C"/"P" or "CALL"/"PUT"
+const rightToCPSafe = (r) =>
+  r === "C" || r === "P" ? r : (r === "CALL" ? "C" : (r === "PUT" ? "P" : r));
+// function withMark(row) {
+//   try {
+//     const occ = toOcc(row.ul, row.expiry, rightToCPSafe(row.right), row.strike);
+//     const q = NBBO_OPT.get(occ);
+//     const bid = q?.bid, ask = q?.ask;
+//     const mark = (Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 && ask > 0)
+//       ? (bid + ask) / 2
+//       : undefined; // keep undefined unless we have a proper NBBO
+//     return { ...row, bid, ask, mark };
+//   } catch {
+//     // If anything is off (e.g., missing fields), just return row unchanged
+//     return row;
+//   }
+// }
+function withMark(row){
+  try {
+    const occ  = toOcc(row.ul, row.expiry, rightToCP(row.right), row.strike);
+    const q    = NBBO_OPT.get?.(occ);
+    const bid  = q?.bid, ask = q?.ask;
+
+    // Prefer explicit mid if you store it
+    const mid  = Number.isFinite(q?.mid) ? q.mid
+               : (Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 && ask > 0)
+                 ? (bid + ask) / 2
+                 : undefined;
+
+    return { ...row, mark: mid };
+  } catch {
+    return { ...row, mark: undefined };
+  }
+}
 app.get("/api/flow/blocks", (req,res)=>{
   const minNotional = Number(req.query.minNotional ?? 50_000);
-  const limit = Number(req.query.limit ?? 50);
+  const limit       = Number(req.query.limit ?? 50);
+
   const rows = computeBlocks(9999, minNotional)
-    .filter(passesPublishGate)                                  // 🔒 NEW
+    .filter(passesPublishGate)
     .slice(0, limit)
-    .map(r => ({ ...r, ul_px: (getUnderlyingLastNear(r.ul, r.ts) ?? getLast(r.ul) ?? null) }));
+    .map(r => ({
+      ...r,
+      ul_px: getUnderlyingLastNear(r.ul, r.ts) ?? getLast(r.ul) ?? null
+    }))
+    .map(withMark);
+
+  // Optional: only broadcast when requested
+  if (req.query.publish === "1") publishBlocks(rows);
+
   res.json({ rows, ts: Date.now() });
 });
 
 app.get("/api/flow/sweeps", (req,res)=>{
   const minNotional = Number(req.query.minNotional ?? 25_000);
-  const limit = Number(req.query.limit ?? 200);
-  const base = computeSweeps(9999, minNotional)
-    .filter(passesPublishGate)                                  // 🔒 NEW
-    .slice(0, limit);
-  const rows = base.map(r => attachDayStats({
-    ...r,
-    ul_px: (getUnderlyingLastNear(r.ul, r.ts) ?? getLast(r.ul) ?? null)
-  }));
+  const limit       = Number(req.query.limit ?? 200);
+
+  const rows = computeSweeps(9999, minNotional)
+    .filter(passesPublishGate)
+    .slice(0, limit)
+    .map(r => ({
+      ...r,
+      ul_px: getUnderlyingLastNear(r.ul, r.ts) ?? getLast(r.ul) ?? null
+    }))
+    .map(attachDayStats)   // stats after ul_px
+    .map(withMark);
+
+  if (req.query.publish === "1") publishSweeps(rows);
+
   res.json({ rows, ts: Date.now() });
 });
+app.post("/api/flow/prints/publish", (req,res)=>{
+  const rows = (req.body?.rows ?? [])
+    .filter(passesPublishGate)
+    .map(p => ({ ...p, ul_px: getUnderlyingLastNear(p.ul, p.ts) ?? getLast(p.ul) ?? null }))
+    .map(withMark);
+
+  publishPrints(rows);
+  res.json({ ok:true, count: rows.length });
+});
+// app.get("/api/flow/blocks", (req,res)=>{
+//   const minNotional = Number(req.query.minNotional ?? 50_000);
+//   const limit = Number(req.query.limit ?? 50);
+//   const rows = computeBlocks(9999, minNotional)
+//     .filter(passesPublishGate)                                  // 🔒 NEW
+//     .slice(0, limit)
+//     // .map(r => ({ ...r, ul_px: (getUnderlyingLastNear(r.ul, r.ts) ?? getLast(r.ul) ?? null) }));
+//    .map(r => ({ ...r, ul_px: (getUnderlyingLastNear(r.ul, r.ts) ?? getLast(r.ul) ?? null) }))
+//    .map(withMark);    
+//   publishBlocks(rows);
+//   res.json({ rows, ts: Date.now() });
+// });
+// app.get("/api/flow/sweeps", (req,res)=>{
+//   const minNotional = Number(req.query.minNotional ?? 25_000);
+//   const limit = Number(req.query.limit ?? 200);
+//   const base = computeSweeps(9999, minNotional)
+//     .filter(passesPublishGate)                                  // 🔒 NEW
+//     .slice(0, limit);
+//   // const rows = base.map(r => attachDayStats({
+//   //   ...r,
+//   //   ul_px: (getUnderlyingLastNear(r.ul, r.ts) ?? getLast(r.ul) ?? null)
+//   // }));
+//  const rows = base
+//    .map(r => attachDayStats({
+//      ...r,
+//      ul_px: (getUnderlyingLastNear(r.ul, r.ts) ?? getLast(r.ul) ?? null)
+//    }))
+//    .map(withMark);  
+//   publishSweeps(rows); 
+//   res.json({ rows, ts: Date.now() });
+// });
 
 // app.get("/api/flow/blocks", (req,res)=>{
 //   const minNotional = Number(req.query.minNotional ?? 50_000);
@@ -2684,6 +2939,13 @@ async function pollOptionsOnce(){
               const bid0 = Number(s0["84"]), ask0 = Number(s0["86"]);
               if (Number.isFinite(bid0) || Number.isFinite(ask0)) {
                 NBBO_OPT.set(occ, { bid: bid0 || 0, ask: ask0 || 0, ts: Date.now() });
+                ingestOptionQuote({
+                  occ,
+                  bid: Number.isFinite(bid0) ? bid0 : undefined,
+                  ask: Number.isFinite(ask0) ? ask0 : undefined,
+                  mid: (Number.isFinite(bid0) && Number.isFinite(ask0) && bid0>0 && ask0>0) ? (bid0+ask0)/2 : undefined,
+                  ts: Date.now()
+                });                
               }
 
               // Emit the UI "tick" row you already use
