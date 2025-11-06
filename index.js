@@ -273,6 +273,8 @@ const SEED_MARK = ""; // disable any seed guard logic downstream
 /* ================= IB HELPERS (cached) ================= */
 const CONID_TTL_MS = 12*60*60*1000;
 const EXP_TTL_MS   = 30*60*1000;
+
+let lastReqEndedAt = 0;
 // function seedWatchlist() {
 //   // equities
 //   const existing = new Set((STATE.watchlist.equities || []).map(s => s.toUpperCase()));
@@ -425,6 +427,27 @@ function nextFridays(n=2){
 // somewhere near your data ingestion
 const LAST_TRADES = [];          // ring buffer of recent option prints
 const MAX_TRADES  = 5000;
+// ---- Underlying last cache (symbol -> { px, ts }) ----
+const ulLast = new Map(); // e.g., "NVDA" -> { px: 123.45, ts: 1730812345123 }
+const UL_STALE_MS = 5_000; // consider quote valid if within 5s of event ts
+
+const MIN_GAP_MS = 250;
+const MAX_RETRIES = 4;
+
+function updateUnderlyingLast(ul, px, ts = Date.now()) {
+  if (!ul) return;
+  const sym = String(ul).toUpperCase();
+  if (!Number.isFinite(px)) return;
+  ulLast.set(sym, { px: Number(px), ts: Number(ts) });
+}
+
+function getUnderlyingLastNear(ul, eventTs) {
+  const sym = String(ul).toUpperCase();
+  const row = ulLast.get(sym);
+  if (!row) return null;
+  const age = Math.abs(Number(eventTs || Date.now()) - row.ts);
+  return age <= UL_STALE_MS ? row.px : null;
+}
 
 /** Push a normalized trade event into buffer */
 function onOptionTrade(ev) {
@@ -434,6 +457,18 @@ function onOptionTrade(ev) {
   LAST_TRADES.push(ev);
   if (LAST_TRADES.length > MAX_TRADES) LAST_TRADES.splice(0, LAST_TRADES.length - MAX_TRADES);
 }
+const DAY_STATS_OPT = new Map(); // occ -> { volume, oi, ts }
+
+// helper stays near toOcc(...)
+function updateDayStats(ul, expiration, right, strike, { volume, oi }) {
+  const occ = toOcc(ul, expiration, right, strike);
+  DAY_STATS_OPT.set(occ, {
+    volume: Number.isFinite(volume) ? volume : undefined,
+    oi: Number.isFinite(oi) ? oi : undefined,
+    ts: Date.now()
+  });
+}
+
 /**
  * Return large single prints as "blocks".
  */
@@ -683,17 +718,20 @@ setInterval(() => {
   const blocks = synthesizeBlocksFrom(LAST_TRADES, { topN: 24, minNotional: 50_000, minQty: 200 });
   const sweeps = synthesizeSweepsFrom(LAST_TRADES, { topN: 120, minNotional: 25_000, minQty: 100 });
 
-  const bJson = JSON.stringify(blocks);
-  const sJson = JSON.stringify(sweeps);
+  // 🔹 NEW: attach ul_px to each row
+  const enrichUL = (r) => ({
+    ...r,
+    ul_px: (getUnderlyingLastNear(r.ul, r.ts) ?? getLast(r.ul) ?? null)
+  });
+  // const blocksE = blocks.map(enrichUL);
+  const blocksE = blocks.map(r => attachDayStats(enrichUL(r)));
+  // const sweepsE = sweeps.map(enrichUL);
+  const sweepsE = sweeps.map(r => attachDayStats(enrichUL(r)));
 
-  if (bJson !== lastBlocks) {
-    wsBroadcast("blocks", blocks);
-    lastBlocks = bJson;
-  }
-  if (sJson !== lastSweeps) {
-    wsBroadcast("sweeps", sweeps);
-    lastSweeps = sJson;
-  }
+  const bJson = JSON.stringify(blocksE);
+  const sJson = JSON.stringify(sweepsE);
+  if (bJson !== lastBlocks) { wsBroadcast("blocks", blocksE); lastBlocks = bJson; }
+  if (sJson !== lastSweeps) { wsBroadcast("sweeps", sweepsE); lastSweeps = sJson; }
 }, 1000);
 
 function seedDemoOptions(){
@@ -1151,9 +1189,6 @@ function monthsTokensToThirdFridays(tokensStr){
 }
 
 /* ================= REQUEST QUEUE (429-safe) ================= */
-let lastReqEndedAt = 0;
-const MIN_GAP_MS = 250;
-const MAX_RETRIES = 4;
 async function ibQueued(label, doFetch){
   const now = Date.now();
   const wait = Math.max(0, (lastReqEndedAt + MIN_GAP_MS) - now);
@@ -1349,18 +1384,33 @@ function mapEquitySnapshot(sym, s) {
   };
 }
 
-function mapOptionTick(ul, expiration, strike, right, s0) {
-  return {
-    underlying: ul,
-    expiration,
-    strike: Number(strike),
-    right,
-    last: toNumStrict(s0["31"]),
-    bid:  toNumStrict(s0["84"]),
-    ask:  toNumStrict(s0["86"]),
-    ts: Date.now()
-  };
-}
+// function mapOptionTick(ul, expiration, strike, right, s0) {
+//   return {
+//     underlying: ul,
+//     expiration,
+//     strike: Number(strike),
+//     right,
+//     last: toNumStrict(s0["31"]),
+//     bid:  toNumStrict(s0["84"]),
+//     ask:  toNumStrict(s0["86"]),
+//     ts: Date.now()
+//   };
+// }
+ function mapOptionTick(ul, expiration, strike, right, s0) {
+   return {
+     underlying: ul,
+     expiration,
+     strike: Number(strike),
+     right,                                  // "C" | "P"
+     last:   toNumStrict(s0["31"]),
+     bid:    toNumStrict(s0["84"]),
+     ask:    toNumStrict(s0["86"]),
+     volume: toNumStrict(s0["7295"]),        // NEW
+     oi:     toNumStrict(s0["7635"]),        // NEW
+     ts: Date.now()
+   };
+ }
+
 /* ================= POLLERS ================= */
 async function ibFetchJson(url, init){
   const r = await fetch(url, init);
@@ -1690,6 +1740,12 @@ async function pollEquitiesOnce(){
       
       for (const r of rows) if (Number.isFinite(r?.last)) onTick(r.symbol, r.last);
       // broadcast the richer payload your UI expects
+      // in pollEquitiesOnce(), right after you build `rows`
+      for (const r of rows) {
+        if (Number.isFinite(r?.last)) {
+          updateUnderlyingLast(r.symbol, r.last, r.ts ?? Date.now()); // <— NEW
+        }
+      }      
       STATE.equities_ts = rows;
       // wsBroadcast("equity_ts", { rows, es_spx_basis });
       wsBroadcast("equity_ts", rows);
@@ -1708,21 +1764,33 @@ app.get('/insights/notables', (req, res) => {
   } catch (e) { res.status(500).json({ error: e?.message||'fail' }); }
 });
 
-// GET /api/flow/blocks?minNotional=50000&limit=50
+setInterval(() => {
+  const payload = buildNotables({ sweeps: STATE.sweeps||[], blocks: STATE.blocks||[] }, NOTABLES_DEFAULT);
+  const s = JSON.stringify(payload);
+  if (s !== lastNotablesJson) { wsBroadcast("notables", payload); lastNotablesJson = s; }
+}, 1500);
+
 app.get("/api/flow/blocks", (req,res)=>{
   const minNotional = Number(req.query.minNotional ?? 50_000);
   const limit = Number(req.query.limit ?? 50);
-  const rows = computeBlocks(9999, minNotional).slice(0, limit);
+  const rows = computeBlocks(9999, minNotional).slice(0, limit).map(r => ({
+    ...r,
+    ul_px: (getUnderlyingLastNear(r.ul, r.ts) ?? getLast(r.ul) ?? null)
+  }));
   res.json({ rows, ts: Date.now() });
 });
 
-// GET /api/flow/sweeps?minNotional=25000&limit=200
 app.get("/api/flow/sweeps", (req,res)=>{
   const minNotional = Number(req.query.minNotional ?? 25_000);
   const limit = Number(req.query.limit ?? 200);
-  const rows = computeSweeps(9999, minNotional).slice(0, limit);
+  const base = computeSweeps(9999, minNotional).slice(0, limit);
+  const rows = base.map(r => attachDayStats({
+    ...r,
+    ul_px: (getUnderlyingLastNear(r.ul, r.ts) ?? getLast(r.ul) ?? null)
+  }));
   res.json({ rows, ts: Date.now() });
 });
+
 app.get("/debug/snapshot_raw", async (req,res)=>{
   try {
     const conids = String(req.query.conids||"").trim();
@@ -1986,7 +2054,112 @@ function nbboFrom(msg) {
     mid
   };
 }
+/* ========== /prices (GET) ========== */
+/**
+ * GET /prices
+ *   ?symbols=SPY,QQQ,ES,SPX   // optional; defaults to current watchlist equities
+ *   → { rows:[{symbol,last,bid,ask,iv,ts}], es_spx_basis:number|null, ts:number }
+ *
+ * Notes:
+ * - Uses ensureConid() so ES resolves to front-month.
+ * - Preserves input order and includes placeholders when a conid can’t be resolved.
+ * - In MOCK mode returns stable-ish synthetic prices.
+ */
+app.get("/prices", async (req, res) => {
+  try {
+    const csv = String(req.query.symbols || "").trim();
+    const inputSyms = csv
+      ? csv.split(",").map((s) => normalizeSymbol(s))
+      : Array.from(WATCH.equities || []).map((s) => normalizeSymbol(s));
 
+    // Nothing to do
+    const symbols = Array.from(new Set(inputSyms)).filter(Boolean);
+    if (!symbols.length) return res.json({ rows: [], es_spx_basis: null, ts: Date.now() });
+
+    // Resolve conids (ES handled inside ensureConid)
+    const pairs = [];
+    for (const sym of symbols) {
+      try {
+        const conid = await ensureConid(sym);
+        if (conid) pairs.push({ sym, conid: String(conid) });
+      } catch (_) {
+        // leave unresolved; we'll make a placeholder below
+      }
+    }
+
+    let rows = [];
+    if (MOCK) {
+      const base = { SPY: 510, QQQ: 430, IWM: 205, SPX: 5600, ES: 5602 };
+      const now = Date.now();
+      rows = symbols.map((s) => ({
+        symbol: s,
+        last: Number(((base[s] ?? 100) + Math.random() * 0.4 - 0.2).toFixed(2)),
+        bid: null,
+        ask: null,
+        iv: s === "MSFT" ? 40 : null,
+        ts: now,
+      }));
+    } else {
+      // Snapshot all resolvable conids
+      const bySym = new Map();
+      if (pairs.length) {
+        const conids = pairs.map((p) => p.conid).join(",");
+        const snaps = await ibFetch(`/iserver/marketdata/snapshot?conids=${encodeURIComponent(conids)}&fields=31,84,86,7059`);
+
+        // Map by conid once for quick lookup
+        const arr = Array.isArray(snaps) ? snaps : (snaps?.data ?? []);
+        const byConid = new Map(arr.map((r) => [String(r.conid), r]));
+
+        // Build rows (preserve exact input order, and add placeholders if needed)
+        for (const sym of symbols) {
+          const pair = pairs.find((p) => p.sym === sym);
+          if (!pair) {
+            rows.push({ symbol: sym, last: null, bid: null, ask: null, iv: null, ts: Date.now() });
+            continue;
+          }
+          const snap = byConid.get(pair.conid);
+          if (!snap) {
+            rows.push({ symbol: sym, last: null, bid: null, ask: null, iv: null, ts: Date.now() });
+            continue;
+          }
+          rows.push(safeMapEquity(sym, snap)); // uses your mapper + synthetic tiny spread when needed
+        }
+      } else {
+        // No conids resolved; still return placeholders
+        rows = symbols.map((sym) => ({ symbol: sym, last: null, bid: null, ask: null, iv: null, ts: Date.now() }));
+      }
+    }
+
+    // Compute ES–SPX basis if both are fresh
+    let es_spx_basis = null;
+    const bySymOut = new Map(rows.map((r) => [normalizeSymbol(r.symbol), r]));
+    const es = bySymOut.get("ES");
+    const spx = bySymOut.get("SPX");
+    if (es && spx && fresh(es) && fresh(spx)) {
+      const esPx = midOrLast(es);
+      const spxPx = midOrLast(spx);
+      if (Number.isFinite(esPx) && Number.isFinite(spxPx)) {
+        es_spx_basis = Number((esPx - spxPx).toFixed(2));
+      }
+    }
+
+    // Update ultra-light last cache used by other parts of your server
+    for (const r of rows) {
+      if (Number.isFinite(r?.last)) updateUnderlyingLast(r.symbol, r.last, r.ts ?? Date.now());
+    }
+
+    res.json({ rows, es_spx_basis, ts: Date.now() });
+  } catch (e) {
+    res.status(500).json({ error: e?.message || "failed" });
+  }
+});
+
+/* Convenience: single-symbol alias */
+app.get("/prices/:symbol", async (req, res) => {
+  const sym = normalizeSymbol(req.params.symbol || "");
+  req.query.symbols = sym;
+  return app._router.handle(req, res, () => {}, "get", "/prices");
+});
 function enrichWithAction(msg) {
   // Already enriched?
   if (msg && (msg.action || msg.action_conf || msg.at)) return msg;
@@ -2041,6 +2214,25 @@ function headlineOfTrade(t /* print|sweep|block */) {
     at: t.at                      // "bid" | "ask" | "mid" | "between"
   };
 }
+function attachDayStats(msg) {
+  const { ul, right, strike, expiry } = legFromMsg(msg);
+  if (!ul || !right || !strike || !expiry) return msg;
+
+  const occ = toOcc(ul, expiry, rightToCP(right), strike);
+  const ds = DAY_STATS_OPT.get(occ);
+
+  if (ds) {
+    msg.cumulativeVol ??= ds.volume;
+    msg.oi ??= ds.oi;
+    const v = Number(msg.cumulativeVol);
+    const o = Number(msg.oi);
+    msg.volOiRatio =
+      Number.isFinite(o) && o > 0 ? v / o
+    : Number.isFinite(v) && v > 0 ? Infinity
+    : 0;
+  }
+  return msg;
+}
 function pushAndFanout(msg) {
   try {
     // ensure enrichment exists once (prints, sweeps, blocks)
@@ -2060,6 +2252,29 @@ function pushAndFanout(msg) {
       });
       Object.assign(msg, inf); // adds action, action_conf, at, priorVol, oi, reason
     }
+
+    // NEW: attach day stats and ratio
+    attachDayStats(msg);
+
+    // 🔹 NEW: attach UL price *at event time*
+    const ul = msg.ul || msg.symbol;
+    const ts = Number(msg.ts) || Date.now();
+    const ulPx =
+      getUnderlyingLastNear(ul, ts) ??
+      getLast(ul) ??                    // very-light fallback
+      null;
+
+    msg.ul_px = Number.isFinite(ulPx) ? Number(ulPx) : null;
+    // const immediate = computeNotables(NOTABLES_DEFAULT);
+    const immediate = buildNotables(
+      { sweeps: STATE.sweeps || [], blocks: STATE.blocks || [] },
+      NOTABLES_DEFAULT
+    );    
+    const s = JSON.stringify(immediate);
+    if (s !== lastNotablesJson) {
+      wsBroadcast("notables", immediate);
+      lastNotablesJson = s;
+    }    
   } catch (_) {}
 
   // keep your existing topic handling
@@ -2078,6 +2293,37 @@ function pushAndFanout(msg) {
   const h = headlineOfTrade(msg);
   wsBroadcast("headlines", [h]);
 }
+
+// Nice-to-have alias under /api:
+// app.get('/api/insights/notables', (req, res) => {
+//   try {
+//     const cfg = Object.fromEntries(
+//       Object.entries(req.query).map(([k, v]) => [k, Number(v)])
+//     );
+//     const payload = computeNotables(Object.keys(cfg).length ? cfg : NOTABLES_DEFAULT);
+//     res.json(payload);
+//   } catch (e) {
+//     res.status(500).json({ error: e?.message || 'fail' });
+//   }
+// });
+app.get('/api/insights/notables', (req, res) => {
+  try {
+    const cfg = Object.fromEntries(Object.entries(req.query).map(([k,v]) => [k, Number(v)]));
+    const payload = buildNotables(
+      { sweeps: STATE.sweeps || [], blocks: STATE.blocks || [] },
+      Object.keys(cfg).length ? cfg : NOTABLES_DEFAULT
+    );
+    res.json(payload);
+  } catch (e) { res.status(500).json({ error: e?.message || 'fail' }); }
+});
+
+// app.get("/api/flow/sweeps", (req,res)=>{
+//   const minNotional = Number(req.query.minNotional ?? 25_000);
+//   const limit = Number(req.query.limit ?? 200);
+//   const base = computeSweeps(9999, minNotional).slice(0, limit);
+//   const rows = base.map(r => attachDayStats({ ...r }));
+//   res.json({ rows, ts: Date.now() });
+// });
 
 // ===================== NEW pushAndFanout =====================
 // function pushAndFanout(msg) {
@@ -2227,6 +2473,11 @@ async function pollOptionsOnce(){
               // Emit the UI "tick" row you already use
               ticks.push(mapOptionTick(ul, expiry, strike, right, s0));
 
+              // add:
+              updateDayStats(ul, expiry, right, strike, {
+                volume: toNumStrict(s0["7295"]),
+                oi:     toNumStrict(s0["7635"]),
+              });
               // Synthesize recent prints from 1-minute bars
               if (!MOCK && optConid) {
                 let bars;
@@ -2250,7 +2501,7 @@ async function pollOptionsOnce(){
                     // --- Fresh book + day stats for better inference (light snapshot) ---
                     let bid = bid0, ask = ask0, cumVol = toNumStrict(s0["7295"]), oiOpt = toNumStrict(s0["7635"]);
                     try {
-                      const lite = await ibFetchJson(`${IB_BASE}/iserver/marketdata/snapshot?conids=${optConid}&fields=84,86,7295,7635`);
+                      const lite = await ibFetchJson(`${IB_BASE}/iserver/marketdata/snapshot?conids=${optConid}&fields=31,84,86,7295,7635`);
                       const r = Array.isArray(lite) && lite[0] ? lite[0] : {};
                       // prefer freshest, fallback to previous
                       bid = Number.isFinite(+r["84"]) ? +r["84"] : bid;
@@ -2801,10 +3052,36 @@ wss.on("connection", (ws) => {
   // wsSend(ws, "watchlist", getWatchlist()); // <-- shared
   wsSend(ws, "watchlist", makeWatchlistPayload());
   wsSend(ws, "headlines", computeHeadlines());   // <— add this
+
+  // NEW: seed "notables" immediately so the widget doesn’t wait 2s tick
+  const bootNotables = computeNotables(NOTABLES_DEFAULT);
+  wsSend(ws, "notables", bootNotables);  
 });
 (async () => {
   try { await seedWatchlist(); } catch (e) { console.warn("seedWatchlist:", e.message); }
 })();
+// =========================================================
+// 1) CONFIG + STATE (place near other top-level consts)
+// =========================================================
+const NOTABLES_DEFAULT = {
+  // tweak to taste (these are sensible real-time defaults)
+  windowMs: 5 * 60_000,   // look back 5 minutes
+  minNotional: 75_000,    // filter out tiny stuff
+  topN: 50,               // cap list size
+  side: "ANY",            // BUY | SELL | ANY
+  expiryMaxDays: 365      // ignore LEAPS if you want
+};
+
+// cache last JSON so we only push when changed
+let lastNotablesJson = "";
+
+// small helper so both REST + WS use the same builder
+function computeNotables(cfg = NOTABLES_DEFAULT) {
+  return buildNotables(
+    { sweeps: STATE.sweeps || [], blocks: STATE.blocks || [] },
+    cfg
+  );
+}
 
 /* ================= SCHEDULERS ================= */
 setInterval(pollEquitiesOnce, 10_000);
@@ -2812,6 +3089,15 @@ setInterval(pollOptionsOnce,  13_000);
 setInterval(pollSweepsOnce,    5_000);
 setInterval(pollBlocksOnce,    5_000);
 setInterval(pruneTapeAges, 2_000);
+setInterval(() => {
+  const notables = computeNotables(NOTABLES_DEFAULT);
+  const s = JSON.stringify(notables);
+  if (s !== lastNotablesJson) {
+    wsBroadcast("notables", notables);
+    lastNotablesJson = s;
+  }
+}, 2000); // lightweight, debounced by JSON compare
+
 function computeHeadlines({ windowMs = ROLLING_MS, minNotional = 50_000, topN = 12 } = {}) {
   const now = Date.now();
   const inWindow = (t) => now - (t?.ts || 0) <= windowMs;
@@ -2899,8 +3185,35 @@ app.get("/api/flow/chains", async (req,res)=>{
 });
 app.get("/api/flow/equity_ts",  (req,res)=>res.json(STATE.equities_ts ?? []));
 app.get("/api/flow/options_ts", (req,res)=>res.json(STATE.options_ts  ?? []));
-app.get("/api/flow/sweeps",     (req,res)=>res.json(STATE.sweeps      ?? []));
-app.get("/api/flow/blocks",     (req,res)=>res.json(STATE.blocks      ?? []));
+// app.get("/api/flow/sweeps",     (req,res)=>res.json(STATE.sweeps      ?? []));
+// app.get("/api/flow/blocks",     (req,res)=>res.json(STATE.blocks      ?? []));
+ // GET /api/insights/oi-vs-vol?ul=NVDA&limit=50
+app.get("/api/insights/oi-vs-vol", (req, res) => {
+  const ul = String(req.query.ul || "").toUpperCase();
+  const limit = Math.max(1, Math.min(200, Number(req.query.limit || 50)));
+  const rows = Array.isArray(STATE.options_ts) ? STATE.options_ts : [];
+  const filtered = rows.filter(r =>
+    (!ul || String(r.underlying).toUpperCase() === ul) &&
+    Number.isFinite(r?.volume) && Number.isFinite(r?.oi) && r.oi >= 0
+  );
+
+  const scored = filtered.map(r => {
+    const ratio = (r.oi > 0) ? (r.volume / r.oi) : (r.volume > 0 ? Infinity : 0);
+    return {
+      underlying: r.underlying,
+      expiration: r.expiration,
+      right: r.right,
+      strike: r.strike,
+      last: r.last,
+      bid: r.bid, ask: r.ask,
+      volume: r.volume, oi: r.oi,
+      ratio,
+     ts: r.ts
+   };
+ }).sort((a,b) => (b.ratio - a.ratio) || (b.volume - a.volume));
+
+ res.json({ rows: scored.slice(0, limit), ts: Date.now() });
+});
 
 app.get("/debug/expirations", async (req,res)=>{
   try {
