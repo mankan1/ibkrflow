@@ -129,6 +129,23 @@ function seenRecently(key, ms) {
   RECENT_SWEEPS.set(key, now);
   return false;
 }
+// ===== Notables broadcast guard =====
+function safeBroadcastNotables(data) {
+  // Normalize to array and drop falsy entries
+  const arr = Array.isArray(data) ? data.filter(Boolean) : [];
+
+  // 1) Skip empty payloads
+  if (arr.length === 0) return;
+
+  // 2) Skip duplicates (same content as last send)
+  const s = JSON.stringify(arr);
+  if (s === lastNotablesJson) return;
+
+  // 3) Broadcast & record
+  wsBroadcast("notables", arr);
+  lastNotablesJson = s;
+}
+
 function maybePublishSweepOrBlock(msg) {
   // msg: { symbol/ul, option{expiration,strike,right}, price, qty, side, nbbo? }
   const notional = Math.round((msg.qty * (msg.price || 0) * 100));
@@ -237,7 +254,7 @@ if (!STATE.watchlist) STATE.watchlist = { equities: [], options: [] };
 //   .map(s => s.trim().toUpperCase())
 //   .filter(Boolean);
 const POPULAR_50 = [
-  "SPY","QQQ","IWM","DIA","SPX","ES"
+  "SPY"// ,"QQQ","IWM","DIA","SPX","ES"
   // ,"TLT","HYG","GLD","SLV","GDX","USO",
   // "AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA","AVGO","AMD","NFLX","SMCI","MU","TSM","INTC","CSCO","IBM","ORCL","CRM",
   // "JPM","BAC","WFC","MS","GS","V","MA","PYPL","SQ","COIN",
@@ -506,8 +523,10 @@ function scheduleNotables() {
 
     const s = JSON.stringify(immediate);
     if (s !== lastNotablesJson) {
-      wsBroadcast("notables", immediate);
-      lastNotablesJson = s;
+      safeBroadcastNotables(immediate.notables || []);
+      // const arr = immediate.notables || [];
+      // wsBroadcast("notables", arr);
+      // lastNotablesJson = s;
     }
   }, 250); // ~4Hz
 }
@@ -2508,7 +2527,8 @@ app.get('/api/insights/notables', (req, res) => {
       { sweeps: STATE.sweeps || [], blocks: STATE.blocks || [], prints: STATE.prints || [] },
       merged
     );
-    res.json(payload);
+    // res.json(payload);
+    res.json({ rows: payload.notables ?? [], ts: Date.now() });
   } catch (e) {
     res.status(500).json({ error: e?.message || 'fail' });
   }
@@ -3308,13 +3328,19 @@ setTimeout(() => runLoop("prune",    pruneTapeAges,    { intervalMs: 2_000  }), 
 
 // Notables: compute → broadcast only on JSON diff (already debounced by compare)
 // let lastNotablesJson = "";
+// runLoop("notables", async () => {
+//   const notables = computeNotables(NOTABLES_DEFAULT);
+//   const s = JSON.stringify(notables);
+//   if (s !== lastNotablesJson) {
+//     const arr = notables || [];
+//     wsBroadcast("notables", arr);
+//     lastNotablesJson = s;
+//   }
+// }, { intervalMs: 2_000 });
+
 runLoop("notables", async () => {
   const notables = computeNotables(NOTABLES_DEFAULT);
-  const s = JSON.stringify(notables);
-  if (s !== lastNotablesJson) {
-    wsBroadcast("notables", notables);
-    lastNotablesJson = s;
-  }
+  safeBroadcastNotables(notables || []);
 }, { intervalMs: 2_000 });
 
 // /* ================= SCHEDULERS ================= */
@@ -3380,11 +3406,19 @@ setInterval(() => {
   wsBroadcast("headlines", headlines);
 }, 2_000);
 
-setInterval(() => {
-  const payload = buildNotables({ sweeps: STATE.sweeps||[], blocks: STATE.blocks||[], prints: STATE.prints||[] }, NOTABLES_DEFAULT)//buildNotables({ sweeps: STATE.sweeps||[], blocks: STATE.blocks||[] }, NOTABLES_DEFAULT);
+// setInterval(() => {
+//   const payload = buildNotables({ sweeps: STATE.sweeps||[], blocks: STATE.blocks||[], prints: STATE.prints||[] }, NOTABLES_DEFAULT)//buildNotables({ sweeps: STATE.sweeps||[], blocks: STATE.blocks||[] }, NOTABLES_DEFAULT);
   
-  const s = JSON.stringify(payload);
-  if (s !== lastNotablesJson) { wsBroadcast("notables", payload); lastNotablesJson = s; }
+//   const s = JSON.stringify(payload);
+//   const arr = payload || [];
+//   if (s !== lastNotablesJson) { wsBroadcast("notables", arr); lastNotablesJson = s; }
+// }, 1500);
+setInterval(() => {
+  const payload = buildNotables(
+    { sweeps: STATE.sweeps||[], blocks: STATE.blocks||[], prints: STATE.prints||[] },
+    NOTABLES_DEFAULT
+  );
+  safeBroadcastNotables(payload || []);
 }, 1500);
 
 // REST endpoint (optional)
