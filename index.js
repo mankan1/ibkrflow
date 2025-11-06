@@ -37,7 +37,12 @@ const ALIASES = new Map([
 //   const s = String(sym||"").trim().toUpperCase();
 //   return ALIASES.get(s) || s;
 // }
-
+// const MIN_SWEEP_QTY      = Number(process.env.MIN_SWEEP_QTY      || 20);
+// const MIN_SWEEP_NOTIONAL = Number(process.env.MIN_SWEEP_NOTIONAL || 10000);
+// const MIN_BLOCK_QTY      = Number(process.env.MIN_BLOCK_QTY      || 100);
+// const MIN_BLOCK_NOTIONAL = Number(process.env.MIN_BLOCK_NOTIONAL || 50000);
+// const BIG_PREMIUM_MIN    = Number(process.env.BIG_PREMIUM_MIN    || 75000);
+// const OTM_QTY_MIN        = Number(process.env.OTM_QTY_MIN        || 50);
 /* ================= CONFIG ================= */
 const PORT    = Number(process.env.PORT || 8080);
 const IB_BASE = String(process.env.IB_BASE || "https://127.0.0.1:5000/v1/api").replace(/\/+$/,"");
@@ -125,25 +130,16 @@ function seenRecently(key, ms) {
   return false;
 }
 function maybePublishSweepOrBlock(msg) {
-  // msg is an options_ts-like object: { symbol, option:{expiration,strike,right}, price, qty, side, ... }
+  // msg: { symbol/ul, option{expiration,strike,right}, price, qty, side, nbbo? }
   const notional = Math.round((msg.qty * (msg.price || 0) * 100));
   const isSweep  = msg.qty >= MIN_SWEEP_QTY && notional >= MIN_SWEEP_NOTIONAL;
   const isBlock  = msg.qty >= MIN_BLOCK_QTY  && notional >= MIN_BLOCK_NOTIONAL;
-
   if (!isSweep && !isBlock) return;
 
-  // Build a stable-ish key to de-dupe mirrored spam
-  const k = [
-    msg.symbol, msg.option?.right, msg.option?.strike, msg.option?.expiration,
-    msg.side, Math.round(msg.price*1000)||0
-  ].join("|");
+  const bid = msg.nbbo?.bid ?? (NBBO_OPT.get(toOcc(msg.symbol, msg.option?.expiration, rightToCP(msg.option?.right), msg.option?.strike))?.bid);
+  const ask = msg.nbbo?.ask ?? (NBBO_OPT.get(toOcc(msg.symbol, msg.option?.expiration, rightToCP(msg.option?.right), msg.option?.strike))?.ask);
 
-  if (seenRecently(k, DEDUP_MS)) return;
-
-  // classify aggressor vs mid for display
   let aggressor = "UNKNOWN";
-  const bid = msg.nbbo?.bid ?? (NBBO_OPT.get(toOcc(msg.symbol, msg.option?.expiration, msg.option?.right, msg.option?.strike))?.bid);
-  const ask = msg.nbbo?.ask ?? (NBBO_OPT.get(toOcc(msg.symbol, msg.option?.expiration, msg.option?.right, msg.option?.strike))?.ask);
   if (Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 && ask > 0) {
     const mid = (bid + ask) / 2;
     const bps = ((msg.price - mid) / mid) * 1e4;
@@ -155,24 +151,78 @@ function maybePublishSweepOrBlock(msg) {
     ts: Date.now(),
     provider: "ibkr",
     symbol: msg.symbol,
+    ul: msg.symbol,  // unify field for gate/helper usage
     right: msg.option?.right,
     strike: msg.option?.strike,
     expiry: msg.option?.expiration,
     side: msg.side,
     qty: msg.qty,
     price: msg.price,
-    bid,
-    ask,
-    aggressor,  // AT_ASK / AT_BID / NEAR_MID / UNKNOWN
+    bid, ask,
+    aggressor,
     notional,
   };
 
-  if (isBlock) {
-    pushAndFanout({ type: "blocks", ...base });
-  } else if (isSweep) {
-    pushAndFanout({ type: "sweeps", ...base });
-  }
+  // 🔒 NEW: hard publish gate
+  if (!passesPublishGate(base)) return;
+
+  const k = [
+    base.symbol, base.right, base.strike, base.expiry,
+    base.side, Math.round(base.price*1000)||0
+  ].join("|");
+  if (seenRecently(k, DEDUP_MS)) return;
+
+  pushAndFanout({ type: isBlock ? "blocks" : "sweeps", ...base });
 }
+// function maybePublishSweepOrBlock(msg) {
+//   // msg is an options_ts-like object: { symbol, option:{expiration,strike,right}, price, qty, side, ... }
+//   const notional = Math.round((msg.qty * (msg.price || 0) * 100));
+//   const isSweep  = msg.qty >= MIN_SWEEP_QTY && notional >= MIN_SWEEP_NOTIONAL;
+//   const isBlock  = msg.qty >= MIN_BLOCK_QTY  && notional >= MIN_BLOCK_NOTIONAL;
+
+//   if (!isSweep && !isBlock) return;
+
+//   // Build a stable-ish key to de-dupe mirrored spam
+//   const k = [
+//     msg.symbol, msg.option?.right, msg.option?.strike, msg.option?.expiration,
+//     msg.side, Math.round(msg.price*1000)||0
+//   ].join("|");
+
+//   if (seenRecently(k, DEDUP_MS)) return;
+
+//   // classify aggressor vs mid for display
+//   let aggressor = "UNKNOWN";
+//   const bid = msg.nbbo?.bid ?? (NBBO_OPT.get(toOcc(msg.symbol, msg.option?.expiration, msg.option?.right, msg.option?.strike))?.bid);
+//   const ask = msg.nbbo?.ask ?? (NBBO_OPT.get(toOcc(msg.symbol, msg.option?.expiration, msg.option?.right, msg.option?.strike))?.ask);
+//   if (Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 && ask > 0) {
+//     const mid = (bid + ask) / 2;
+//     const bps = ((msg.price - mid) / mid) * 1e4;
+//     aggressor = bps >= TAPE_CFG.sweep.atAskBps ? "AT_ASK" : (bps <= -TAPE_CFG.sweep.atAskBps ? "AT_BID" : "NEAR_MID");
+//   }
+
+//   const base = {
+//     id: `${Date.now()}-${Math.random().toString(36).slice(2,8)}`,
+//     ts: Date.now(),
+//     provider: "ibkr",
+//     symbol: msg.symbol,
+//     right: msg.option?.right,
+//     strike: msg.option?.strike,
+//     expiry: msg.option?.expiration,
+//     side: msg.side,
+//     qty: msg.qty,
+//     price: msg.price,
+//     bid,
+//     ask,
+//     aggressor,  // AT_ASK / AT_BID / NEAR_MID / UNKNOWN
+//     notional,
+//   };
+
+//   if (isBlock) {
+//     pushAndFanout({ type: "blocks", ...base });
+//   } else if (isSweep) {
+//     pushAndFanout({ type: "sweeps", ...base });
+//   }
+// }
 
 if (!global.STATE) global.STATE = {};
 if (!STATE.watchlist) STATE.watchlist = { equities: [], options: [] };
@@ -214,6 +264,8 @@ const DEFAULT_EQUITIES = (process.env.DEFAULT_EQUITIES || POPULAR_50.join(","))
 // }
 // ---- Do NOT auto-seed on normal boot ----
 // If you really want to seed when empty, set SEED_ON_EMPTY=1
+const SEED_MARK = ""; // disable any seed guard logic downstream
+
 if (SEED_ON_EMPTY && (WATCH.equities.size === 0) && !fs.existsSync(SEED_MARK)) {
   (async () => {
     for (const s of DEFAULT_EQUITIES) await addEquity(s);
@@ -268,7 +320,6 @@ function normalizeIv(ivRaw) {
 const DEFAULT_OPTIONS = (process.env.DEFAULT_OPTIONS || "").trim()
   ? JSON.parse(process.env.DEFAULT_OPTIONS)
   : []; // no demo seeds
-const SEED_MARK = ""; // disable any seed guard logic downstream
 
 /* ================= IB HELPERS (cached) ================= */
 const CONID_TTL_MS = 12*60*60*1000;
@@ -417,6 +468,49 @@ function nextFridays(n=2){
   }
   return out;
 }
+let notablesDirty = false;
+let notablesTimer = null;
+// cache last JSON so we only push when changed
+let lastNotablesJson = "";
+
+// =========================================================
+// 1) CONFIG + STATE (place near other top-level consts)
+// =========================================================
+const NOTABLES_DEFAULT = {
+  // tweak to taste (these are sensible real-time defaults)
+  windowMs: 5 * 60_000,   // look back 5 minutes
+  minNotional: 75_000,    // filter out tiny stuff
+  topN: 50,               // cap list size
+  side: "ANY",            // BUY | SELL | ANY
+  expiryMaxDays: 365      // ignore LEAPS if you want
+};
+
+function scheduleNotables() {
+  notablesDirty = true;
+  if (notablesTimer) return;
+  notablesTimer = setTimeout(() => {
+    notablesTimer = null;
+    if (!notablesDirty) return;
+    notablesDirty = false;
+
+    const immediate = buildNotables(
+      { sweeps: STATE.sweeps || [], blocks: STATE.blocks || [], prints: STATE.prints || [] },
+      NOTABLES_DEFAULT
+    );
+
+    // Don’t broadcast a totally empty set if the last one had items
+    const prev = lastNotablesJson ? JSON.parse(lastNotablesJson) : null;
+    const hadStuff = !!(prev?.notables?.length || prev?.all?.length);
+    const hasStuff = !!(immediate?.notables?.length || immediate?.all?.length);
+    if (!hasStuff && hadStuff) return; // suppress empty wipe
+
+    const s = JSON.stringify(immediate);
+    if (s !== lastNotablesJson) {
+      wsBroadcast("notables", immediate);
+      lastNotablesJson = s;
+    }
+  }, 250); // ~4Hz
+}
 // const STATE = {
 //   equities_ts: [],
 //   options_ts:  [],
@@ -427,6 +521,39 @@ function nextFridays(n=2){
 // somewhere near your data ingestion
 const LAST_TRADES = [];          // ring buffer of recent option prints
 const MAX_TRADES  = 5000;
+// ===== Publish gates =====
+const BIG_PREMIUM_MIN = Number(process.env.BIG_PREMIUM_MIN || 200_000);
+const OTM_QTY_MIN     = Number(process.env.OTM_QTY_MIN     || 150);
+
+function rightAsCP(r){
+  const s = String(r||"").toUpperCase();
+  return s === "CALL" || s === "C" ? "C"
+       : s === "PUT"  || s === "P" ? "P" : undefined;
+}
+
+function isOTM(ulPx, right, strike){
+  if (!Number.isFinite(ulPx)) return false;          // can't judge → not OTM
+  const cp = rightAsCP(right);
+  if (!cp || !Number.isFinite(+strike)) return false;
+  return (cp === "C" ? strike > ulPx : strike < ulPx);
+}
+
+/** central gate: allow only big premium OR OTM with large size */
+function passesPublishGate(msg){
+  const notional = Number(msg?.notional);
+  if (Number.isFinite(notional) && notional >= BIG_PREMIUM_MIN) return true;
+
+  const qty = Number(msg?.qty);
+  if (!Number.isFinite(qty) || qty < OTM_QTY_MIN) return false;
+
+  // need UL price to decide OTM
+  const ul   = msg.ul || msg.symbol;
+  const when = Number(msg.ts) || Date.now();
+  const ulPx = getUnderlyingLastNear(ul, when) ?? getLast(ul) ?? null;
+
+  return isOTM(ulPx, msg.right || msg?.option?.right, msg.strike ?? msg?.option?.strike);
+}
+
 // ---- Underlying last cache (symbol -> { px, ts }) ----
 const ulLast = new Map(); // e.g., "NVDA" -> { px: 123.45, ts: 1730812345123 }
 const UL_STALE_MS = 5_000; // consider quote valid if within 5s of event ts
@@ -461,7 +588,7 @@ const DAY_STATS_OPT = new Map(); // occ -> { volume, oi, ts }
 
 // helper stays near toOcc(...)
 function updateDayStats(ul, expiration, right, strike, { volume, oi }) {
-  const occ = toOcc(ul, expiration, right, strike);
+  const occ = toOcc(ul, expiration, rightToCP(right), strike);
   DAY_STATS_OPT.set(occ, {
     volume: Number.isFinite(volume) ? volume : undefined,
     oi: Number.isFinite(oi) ? oi : undefined,
@@ -727,6 +854,11 @@ setInterval(() => {
   const blocksE = blocks.map(r => attachDayStats(enrichUL(r)));
   // const sweepsE = sweeps.map(enrichUL);
   const sweepsE = sweeps.map(r => attachDayStats(enrichUL(r)));
+  STATE.blocks = blocksE;
+
+  STATE.sweeps = sweepsE;
+
+  scheduleNotables(); // mark dirty so notables recomputes off new STATE
 
   const bJson = JSON.stringify(blocksE);
   const sJson = JSON.stringify(sweepsE);
@@ -780,8 +912,8 @@ async function resolveFrontMonth(symbol){ // symbol like "ES"
 }
 
 // on boot (and maybe every few hours)
-await resolveFrontMonth("ES");
-
+// await resolveFrontMonth("ES");
+await resolveFrontMonthES().catch(()=>{});
 // when snapshotting:
 function symbolToConid(symbol){
   if (symbol === "/ES" || symbol === "ES"){
@@ -1755,41 +1887,69 @@ async function pollEquitiesOnce(){
     console.warn("pollEquitiesOnce:", e.message);
   }
 }
-app.get('/insights/notables', (req, res) => {
-  try {
-    const cfg = Object.fromEntries(Object.entries(req.query).map(([k,v])=>[k, Number(v)]));
-    // const payload = buildNotables({ sweeps: memory.sweeps||[], blocks: memory.blocks||[] }, cfg);
-    const payload = buildNotables({ sweeps: STATE.sweeps || [], blocks: STATE.blocks || [] }, cfg);
-    res.json(payload);
-  } catch (e) { res.status(500).json({ error: e?.message||'fail' }); }
-});
+// app.get('/insights/notables', (req, res) => {
+//   try {
+//     const cfg = Object.fromEntries(Object.entries(req.query).map(([k,v])=>[k, Number(v)]));
+//     // const payload = buildNotables({ sweeps: memory.sweeps||[], blocks: memory.blocks||[] }, cfg);
+//     const payload = buildNotables({ sweeps: STATE.sweeps || [], blocks: STATE.blocks || [] }, cfg);
+//     res.json(payload);
+//   } catch (e) { res.status(500).json({ error: e?.message||'fail' }); }
+// });
 
-setInterval(() => {
-  const payload = buildNotables({ sweeps: STATE.sweeps||[], blocks: STATE.blocks||[] }, NOTABLES_DEFAULT);
-  const s = JSON.stringify(payload);
-  if (s !== lastNotablesJson) { wsBroadcast("notables", payload); lastNotablesJson = s; }
-}, 1500);
+
+
+// const NOTABLES_DEFAULT = { 
+//   windowMs: 5*60_000, 
+//   minNotional: 75_000, 
+//   topN: 50, 
+//   side: "ANY", 
+//   expiryMaxDays: 365 
+// };
+
 
 app.get("/api/flow/blocks", (req,res)=>{
   const minNotional = Number(req.query.minNotional ?? 50_000);
   const limit = Number(req.query.limit ?? 50);
-  const rows = computeBlocks(9999, minNotional).slice(0, limit).map(r => ({
-    ...r,
-    ul_px: (getUnderlyingLastNear(r.ul, r.ts) ?? getLast(r.ul) ?? null)
-  }));
+  const rows = computeBlocks(9999, minNotional)
+    .filter(passesPublishGate)                                  // 🔒 NEW
+    .slice(0, limit)
+    .map(r => ({ ...r, ul_px: (getUnderlyingLastNear(r.ul, r.ts) ?? getLast(r.ul) ?? null) }));
   res.json({ rows, ts: Date.now() });
 });
 
 app.get("/api/flow/sweeps", (req,res)=>{
   const minNotional = Number(req.query.minNotional ?? 25_000);
   const limit = Number(req.query.limit ?? 200);
-  const base = computeSweeps(9999, minNotional).slice(0, limit);
+  const base = computeSweeps(9999, minNotional)
+    .filter(passesPublishGate)                                  // 🔒 NEW
+    .slice(0, limit);
   const rows = base.map(r => attachDayStats({
     ...r,
     ul_px: (getUnderlyingLastNear(r.ul, r.ts) ?? getLast(r.ul) ?? null)
   }));
   res.json({ rows, ts: Date.now() });
 });
+
+// app.get("/api/flow/blocks", (req,res)=>{
+//   const minNotional = Number(req.query.minNotional ?? 50_000);
+//   const limit = Number(req.query.limit ?? 50);
+//   const rows = computeBlocks(9999, minNotional).slice(0, limit).map(r => ({
+//     ...r,
+//     ul_px: (getUnderlyingLastNear(r.ul, r.ts) ?? getLast(r.ul) ?? null)
+//   }));
+//   res.json({ rows, ts: Date.now() });
+// });
+
+// app.get("/api/flow/sweeps", (req,res)=>{
+//   const minNotional = Number(req.query.minNotional ?? 25_000);
+//   const limit = Number(req.query.limit ?? 200);
+//   const base = computeSweeps(9999, minNotional).slice(0, limit);
+//   const rows = base.map(r => attachDayStats({
+//     ...r,
+//     ul_px: (getUnderlyingLastNear(r.ul, r.ts) ?? getLast(r.ul) ?? null)
+//   }));
+//   res.json({ rows, ts: Date.now() });
+// });
 
 app.get("/debug/snapshot_raw", async (req,res)=>{
   try {
@@ -2237,7 +2397,7 @@ function pushAndFanout(msg) {
   try {
     // ensure enrichment exists once (prints, sweeps, blocks)
     if (!msg.action) {
-      const occ = toOcc(msg.symbol, msg?.option?.expiration, msg?.option?.right, msg?.option?.strike);
+      const occ = toOcc(msg.symbol, msg?.option?.expiration, rightToCP(msg?.option?.right), msg?.option?.strike);
       const bid = Number(msg?.nbbo?.bid), ask = Number(msg?.nbbo?.ask);
       const mid = (Number.isFinite(bid) && Number.isFinite(ask) && bid>0 && ask>0) ? (bid+ask)/2 : undefined;
       const inf = inferActionForOptionTrade({
@@ -2266,27 +2426,41 @@ function pushAndFanout(msg) {
 
     msg.ul_px = Number.isFinite(ulPx) ? Number(ulPx) : null;
     // const immediate = computeNotables(NOTABLES_DEFAULT);
-    const immediate = buildNotables(
-      { sweeps: STATE.sweeps || [], blocks: STATE.blocks || [] },
-      NOTABLES_DEFAULT
-    );    
-    const s = JSON.stringify(immediate);
-    if (s !== lastNotablesJson) {
-      wsBroadcast("notables", immediate);
-      lastNotablesJson = s;
-    }    
+    // const immediate = buildNotables(
+    //   { sweeps: STATE.sweeps || [], blocks: STATE.blocks || [], prints: STATE.prints||[] },
+    //   NOTABLES_DEFAULT
+    // );    
+    // const immediate = scheduleNotables()
+    // const s = JSON.stringify(immediate);
+    // if (s !== lastNotablesJson) {
+    //   wsBroadcast("notables", immediate);
+    //   lastNotablesJson = s;
+    // }    
+    scheduleNotables();
   } catch (_) {}
+
+  // 🔒 NEW: apply publish gate to sweeps/blocks globally
+  if (msg?.type === "sweeps" || msg?.type === "blocks") {
+    if (!passesPublishGate(msg)) return;   // drop quietly
+  }
 
   // keep your existing topic handling
   if (msg?.type === "sweeps") {
     STATE.sweeps = [...(STATE.sweeps || []), msg];
     wsBroadcast("sweeps", STATE.sweeps.slice(-500));
+    // optional: also headline
+    const h = headlineOfTrade(msg); wsBroadcast("headlines", [h]);
+    return;
   } else if (msg?.type === "blocks") {
     STATE.blocks = [...(STATE.blocks || []), msg];
     wsBroadcast("blocks", STATE.blocks.slice(-500));
+    const h = headlineOfTrade(msg); wsBroadcast("headlines", [h]);
+    return;
   } else if (msg?.type === "print") {
     STATE.prints = [...(STATE.prints || []), msg].slice(-2000);
     wsBroadcast("prints", [msg]); // light push for clients
+    const h = headlineOfTrade(msg); wsBroadcast("headlines", [h]);
+    return;
   }
 
   // 🔹 NEW: always publish an enriched headline for *any* trade
@@ -2306,17 +2480,39 @@ function pushAndFanout(msg) {
 //     res.status(500).json({ error: e?.message || 'fail' });
 //   }
 // });
+// app.get('/api/insights/notables', (req, res) => {
+//   try {
+//     const cfg = Object.fromEntries(Object.entries(req.query).map(([k,v]) => [k, Number(v)]));
+//     const payload = buildNotables(
+//       { sweeps: STATE.sweeps || [], blocks: STATE.blocks || [], prints: STATE.prints||[] },
+//       Object.keys(cfg).length ? cfg : NOTABLES_DEFAULT
+//     );
+//     res.json(payload);
+//   } catch (e) { res.status(500).json({ error: e?.message || 'fail' }); }
+// });
 app.get('/api/insights/notables', (req, res) => {
   try {
-    const cfg = Object.fromEntries(Object.entries(req.query).map(([k,v]) => [k, Number(v)]));
+    const q = req.query || {};
+    const cfg = {
+      windowMs:      q.windowMs      ? Number(q.windowMs)      : undefined,
+      minNotional:   q.minNotional   ? Number(q.minNotional)   : undefined,
+      topN:          q.topN          ? Number(q.topN)          : undefined,
+      expiryMaxDays: q.expiryMaxDays ? Number(q.expiryMaxDays) : undefined,
+      side:          q.side && typeof q.side === 'string' ? q.side.toUpperCase() : undefined, // "BUY"|"SELL"|"ANY"
+    };
+    // Drop undefined keys; fall back to defaults
+    const clean = Object.fromEntries(Object.entries(cfg).filter(([,v]) => v !== undefined));
+    const merged = { ...NOTABLES_DEFAULT, ...clean };
+
     const payload = buildNotables(
-      { sweeps: STATE.sweeps || [], blocks: STATE.blocks || [] },
-      Object.keys(cfg).length ? cfg : NOTABLES_DEFAULT
+      { sweeps: STATE.sweeps || [], blocks: STATE.blocks || [], prints: STATE.prints || [] },
+      merged
     );
     res.json(payload);
-  } catch (e) { res.status(500).json({ error: e?.message || 'fail' }); }
+  } catch (e) {
+    res.status(500).json({ error: e?.message || 'fail' });
+  }
 });
-
 // app.get("/api/flow/sweeps", (req,res)=>{
 //   const minNotional = Number(req.query.minNotional ?? 25_000);
 //   const limit = Number(req.query.limit ?? 200);
@@ -2464,7 +2660,7 @@ async function pollOptionsOnce(){
               }
 
               // Update NBBO cache (so classifier has context)
-              const occ = toOcc(ul, expiry, right, strike);
+              const occ = toOcc(ul, expiry, rightToCP(right), strike);
               const bid0 = Number(s0["84"]), ask0 = Number(s0["86"]);
               if (Number.isFinite(bid0) || Number.isFinite(ask0)) {
                 NBBO_OPT.set(occ, { bid: bid0 || 0, ask: ask0 || 0, ts: Date.now() });
@@ -3060,43 +3256,81 @@ wss.on("connection", (ws) => {
 (async () => {
   try { await seedWatchlist(); } catch (e) { console.warn("seedWatchlist:", e.message); }
 })();
-// =========================================================
-// 1) CONFIG + STATE (place near other top-level consts)
-// =========================================================
-const NOTABLES_DEFAULT = {
-  // tweak to taste (these are sensible real-time defaults)
-  windowMs: 5 * 60_000,   // look back 5 minutes
-  minNotional: 75_000,    // filter out tiny stuff
-  topN: 50,               // cap list size
-  side: "ANY",            // BUY | SELL | ANY
-  expiryMaxDays: 365      // ignore LEAPS if you want
-};
-
-// cache last JSON so we only push when changed
-let lastNotablesJson = "";
-
 // small helper so both REST + WS use the same builder
 function computeNotables(cfg = NOTABLES_DEFAULT) {
   return buildNotables(
-    { sweeps: STATE.sweeps || [], blocks: STATE.blocks || [] },
+    { sweeps: STATE.sweeps || [], blocks: STATE.blocks || [], prints: STATE.prints||[]  },
     cfg
   );
 }
 
-/* ================= SCHEDULERS ================= */
-setInterval(pollEquitiesOnce, 10_000);
-setInterval(pollOptionsOnce,  13_000);
-setInterval(pollSweepsOnce,    5_000);
-setInterval(pollBlocksOnce,    5_000);
-setInterval(pruneTapeAges, 2_000);
-setInterval(() => {
+const STOP = { value: false };
+process.on("SIGTERM", () => (STOP.value = true));
+process.on("SIGINT",  () => (STOP.value = true));
+
+// const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const jitter = (ms, pct = 0.10) => {
+  const j = ms * pct;
+  return ms + (Math.random() * 2 * j - j);
+};
+
+// Runs fn → waits (with jitter/backoff) → runs again; no overlap/drift.
+function runLoop(name, fn, { intervalMs, jitterPct = 0.10, maxBackoffMs = 30_000 } = {}) {
+  let running = false;
+  let backoffMs = 0;
+
+  (async function loop() {
+    while (!STOP.value) {
+      if (!running) {
+        running = true;
+        try {
+          await fn();
+          backoffMs = 0; // reset on success
+        } catch (err) {
+          console.error(`[${name}]`, err?.message || err);
+          backoffMs = Math.min((backoffMs || 1_000) * 2, maxBackoffMs);
+        } finally {
+          running = false;
+        }
+      }
+      const base = backoffMs || intervalMs;
+      await sleep(jitter(base, jitterPct));
+    }
+  })();
+}
+
+// Stagger the initial kicks slightly to avoid synchronized bursts.
+setTimeout(() => runLoop("equities", pollEquitiesOnce, { intervalMs: 10_000 }),  0);
+setTimeout(() => runLoop("options",  pollOptionsOnce,  { intervalMs: 13_000 }), 250);
+setTimeout(() => runLoop("sweeps",   pollSweepsOnce,   { intervalMs: 5_000  }), 500);
+setTimeout(() => runLoop("blocks",   pollBlocksOnce,   { intervalMs: 5_000  }), 750);
+setTimeout(() => runLoop("prune",    pruneTapeAges,    { intervalMs: 2_000  }), 1000);
+
+// Notables: compute → broadcast only on JSON diff (already debounced by compare)
+// let lastNotablesJson = "";
+runLoop("notables", async () => {
   const notables = computeNotables(NOTABLES_DEFAULT);
   const s = JSON.stringify(notables);
   if (s !== lastNotablesJson) {
     wsBroadcast("notables", notables);
     lastNotablesJson = s;
   }
-}, 2000); // lightweight, debounced by JSON compare
+}, { intervalMs: 2_000 });
+
+// /* ================= SCHEDULERS ================= */
+// setInterval(pollEquitiesOnce, 10_000);
+// setInterval(pollOptionsOnce,  13_000);
+// setInterval(pollSweepsOnce,    5_000);
+// setInterval(pollBlocksOnce,    5_000);
+// setInterval(pruneTapeAges, 2_000);
+// setInterval(() => {
+//   const notables = computeNotables(NOTABLES_DEFAULT);
+//   const s = JSON.stringify(notables);
+//   if (s !== lastNotablesJson) {
+//     wsBroadcast("notables", notables);
+//     lastNotablesJson = s;
+//   }
+// }, 2000); // lightweight, debounced by JSON compare
 
 function computeHeadlines({ windowMs = ROLLING_MS, minNotional = 50_000, topN = 12 } = {}) {
   const now = Date.now();
@@ -3145,6 +3379,13 @@ setInterval(() => {
   const headlines = computeHeadlines({ windowMs: ROLLING_MS, minNotional: 50_000, topN: 12 });
   wsBroadcast("headlines", headlines);
 }, 2_000);
+
+setInterval(() => {
+  const payload = buildNotables({ sweeps: STATE.sweeps||[], blocks: STATE.blocks||[], prints: STATE.prints||[] }, NOTABLES_DEFAULT)//buildNotables({ sweeps: STATE.sweeps||[], blocks: STATE.blocks||[] }, NOTABLES_DEFAULT);
+  
+  const s = JSON.stringify(payload);
+  if (s !== lastNotablesJson) { wsBroadcast("notables", payload); lastNotablesJson = s; }
+}, 1500);
 
 // REST endpoint (optional)
 app.get("/api/flow/headlines", (_req, res) => {
