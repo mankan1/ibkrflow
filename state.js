@@ -5,10 +5,19 @@ const rightMap = (x) => {
   if (s==="PUT" ||s==="P") return "P";
   return "";
 };
-export const normalizeSymbol = (s) => {
-  const up = String(s || "").trim().toUpperCase();
-  return FUT_ALIASES.get(up) || up;
-};
+// export const normalizeSymbol = (s) => {
+//   const up = String(s || "").trim().toUpperCase();
+//   return FUT_ALIASES.get(up) || up;
+// };
+function normalizeSymbol(sym = "") {
+  const s = String(sym).trim().toUpperCase();
+  // Indexes, ETFs: leave as is (SPX, SPY, QQQ, AAPL, NVDA ...)
+  // Futures: force leading slash for root/front-month aliases
+  if (s === "ES" || s === "/ES") return "/ES";
+  if (s === "NQ" || s === "/NQ") return "/NQ";
+  if (s === "YM" || s === "/YM") return "/YM";
+  return s;
+}
 
 export const WATCH = {
   equities: new Set(),   // single source of truth

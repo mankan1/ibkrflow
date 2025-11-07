@@ -1,16 +1,15 @@
-// index.js — TradeFlash drop-in server with IB 429 backoff, caches, and robust pollers.
-// Run: NODE_TLS_REJECT_UNAUTHORIZED=0 PORT=8080 node index.js
-// Env:
-//   PORT=8080
-//   IB_BASE=https://127.0.0.1:5000/v1/api
-//   MOCK=0|1     (for offline mocking)
-
 import http from "http";
 import express from "express";
 import cors from "cors";
 import compression from "compression";
 import morgan from "morgan";
 import { WebSocketServer } from "ws";
+
+import makePrintsRouter from "./routes/prints.js";
+import makeHeadlinesRouter from "./routes/headlines.js";
+import { makeBus } from "./ws/bus.js";
+import { d } from "./debug/logger.js";
+
 import fs from "fs";
 import {
   inferActionForOptionTrade,
@@ -19,10 +18,10 @@ import {
 import { buildNotables } from './insights/notables.js';
 
 import { router as watchlistRouter } from "./routes/watchlist.js";
-import { loadWatchlistFile, saveWatchlistFile, buildOptionsAroundATM } from "./watchlist.js";
+import { loadWatchlistFile, saveWatchlistFile } from "./watchlist.js";
 
 import {
-  WATCH, getWatchlist, addEquity, addOptions, normalizeSymbol,
+  WATCH, getWatchlist, addEquity, addOptions, 
   setBroadcaster, broadcastWatchlist
 } from "./state.js";
 
@@ -33,26 +32,84 @@ const ALIASES = new Map([
   ["/ES", "ES"],
   ["ES1!", "ES"],   // TradingView style
 ]);
-// function canon(sym) {
-//   const s = String(sym||"").trim().toUpperCase();
-//   return ALIASES.get(s) || s;
-// }
-// const MIN_SWEEP_QTY      = Number(process.env.MIN_SWEEP_QTY      || 20);
-// const MIN_SWEEP_NOTIONAL = Number(process.env.MIN_SWEEP_NOTIONAL || 10000);
-// const MIN_BLOCK_QTY      = Number(process.env.MIN_BLOCK_QTY      || 100);
-// const MIN_BLOCK_NOTIONAL = Number(process.env.MIN_BLOCK_NOTIONAL || 50000);
-// const BIG_PREMIUM_MIN    = Number(process.env.BIG_PREMIUM_MIN    || 75000);
-// const OTM_QTY_MIN        = Number(process.env.OTM_QTY_MIN        || 50);
+
+/** Aliases -> canonical ticker. Keep keys canonical and values as all accepted aliases. */
+const CANON_ALIASES = {
+  // Indexes
+  SPX: ["SPX", "SPX.X", "/SPX", "^GSPC", "$SPX"],
+  NDX: ["NDX", "^NDX", "$NDX"],
+  DJX: ["DJX", "DJIA", "^DJI", "$DJI", "$DJX"],
+  // ETFs (common)
+  SPY: ["SPY", "$SPY"],
+  QQQ: ["QQQ", "$QQQ"],
+  IWM: ["IWM", "$IWM"],
+  // Futures (pick one canonical — here we use "ES")
+  ES:  ["ES", "/ES", "ES=F", "ES1!", "$ES", "MES"], // treat MES as ES for top-level quote use
+  NQ:  ["NQ", "/NQ", "NQ=F", "NQ1!", "$NQ", "MNQ"],
+  YM:  ["YM", "/YM", "YM=F", "YM1!", "$YM", "MYM"],
+};
+
+/** Fast lookup map (alias -> canonical). */
+const ALIAS_TO_CANON = (() => {
+  const m = new Map();
+  for (const [canon, aliases] of Object.entries(CANON_ALIASES)) {
+    for (const a of aliases) m.set(a.toUpperCase(), canon);
+  }
+  return m;
+})();
+
+/** Attempt to extract underlying from OCC-style option symbol (very lenient). */
+function extractUnderlyingFromOCC(s) {
+  // Examples: "SPX   251121C00500000", "AAPL  251121P00190000"
+  // If it looks like "UNDERLYING<spaces>YYMMDD[CP]strike" return the first token.
+  const m = String(s).trim().match(/^([A-Za-z.$/^]+)\s{2,}\d{6}[CP]/);
+  return m ? m[1] : null;
+}
+
+/** Canonicalize user-entered symbols for consistent keys & lookups. */
+function normalizeSymbol(input) {
+  if (!input) return "";
+  // Uppercase, trim, strip leading $, spaces
+  let s = String(input).trim().toUpperCase().replace(/^\$/, "");
+
+  // If it's an OCC-like option root, peel off the underlying
+  const occUl = extractUnderlyingFromOCC(s);
+  if (occUl) s = occUl.toUpperCase().replace(/^\$/, "");
+
+  // Simple alias resolution
+  if (ALIAS_TO_CANON.has(s)) return ALIAS_TO_CANON.get(s);
+
+  // Handle leading slash on futures generically ("/ES" -> "ES")
+  if (s.startsWith("/")) s = s.slice(1);
+
+  // Strip common suffixes some vendors add (e.g., ".X")
+  s = s.replace(/\.X$/, "");
+
+  return s;
+}
+
+/**
+ * Deduplicate by canonical symbol. Keeps the first occurrence for each symbol.
+ * Accepts either [{symbol, ...}] rows or [{sym, conid}] pairs — pass a projector to read the symbol.
+ */
+function fixCollision(items, getSym = (x) => x.symbol, setSym = (x, s) => (x.symbol = s)) {
+  const seen = new Set();
+  const out = [];
+  for (const it of items) {
+    const canon = normalizeSymbol(getSym(it));
+    if (seen.has(canon)) continue;
+    seen.add(canon);
+    setSym(it, canon);
+    out.push(it);
+  }
+  return out;
+}
+
 /* ================= CONFIG ================= */
 const PORT    = Number(process.env.PORT || 8080);
 const IB_BASE = String(process.env.IB_BASE || "https://127.0.0.1:5000/v1/api").replace(/\/+$/,"");
 const MOCK    = String(process.env.MOCK || "") === "1";
 
-/* ================= STATE ================= */
-// const WATCH = {
-//   equities: new Set(),                 // "AAPL","NVDA","MSFT"
-//   options: [],                         // {underlying, expiration(YYYY-MM-DD), strike, right(C|P)}
-// };
 const STATE = {
   equities_ts: [],                     // [{symbol,last,bid,ask,iv?,ts}]
   options_ts:  [],                     // [{underlying,expiration,strike,right,last,bid,ask,ts}]
@@ -68,7 +125,8 @@ const cacheOptConid = new Map(); // key: "AAPL|2025-12-19|C|200" -> { conid, ts 
 // ===== Option quotes buffer (debounced) -> pushes topic: option_quotes
 const optionQuoteBuf = new Map(); // occ -> { occ, bid, ask, mid, ts }
 const OPTION_QUOTES_FLUSH_MS = 500;
-
+const FUT_ROOTS = new Set(["ES", "NQ", "YM", "RTY", "CL", "GC"]); // add what you want
+const isFutures = (ul) => FUT_ROOTS.has(ul.toUpperCase().replace(/^\//,""));
 const CACHE = {
   conidBySym: new Map(),               // key: "AAPL" -> { conid, ts }
   expBySym:   new Map(),               // key: "AAPL" -> { ts, expirations: [...] }
@@ -89,13 +147,6 @@ if (String(process.env.NODE_TLS_REJECT_UNAUTHORIZED) === "0") {
 }
 console.log(`HTTP+WS @ :${PORT}  MOCK=${MOCK?"on":"off"}  IB=${IB_BASE}`);
 
-/* ================= APP/WS ================= */
-// const app = express();
-
-// app.use(express.json());
-// app.use("/watchlist", watchlistRouter);
-// app.use(cors());                // if you need to lock this down: cors({ origin: [/localhost/, /tradeflow\.lol$/] })
-
 const app = express();
 app.use(cors({                 // allow your dev client
   origin: ["http://localhost:8081", "http://127.0.0.1:8081"],
@@ -111,16 +162,13 @@ app.use(compression());
 app.use(morgan("dev"));
 const FUT_ALIASES = new Map([["/ES","ES"], ["ES","ES"]]);
 
-/* ================= WATCHLIST STATE ================= */
-// const DEFAULT_EQUITIES = (process.env.DEFAULT_EQUITIES || "AAPL,MSFT,NVDA").split(",").map(s=>s.trim()).filter(Boolean);
+const server = http.createServer(app);
+let wsReady = false;
+let wss = /** @type {import('ws').WebSocketServer|null} */ (null);
 
-// // Optional: “read-only demo” options list for your UI
-// // Format matches what your UI renders: UL, Right, Strike, Expiry
-// const DEFAULT_OPTIONS = [
-//   { ul: "AAPL", right: "C", strike: 200, expiry: "2025-12-19" },
-//   { ul: "NVDA", right: "P", strike: 220, expiry: "2025-11-21" },
-//   { ul: "MSFT", right: "C", strike: 520, expiry: "2025-12-19" },
-// ];
+// ---- Create WS server, then mark ready and flush any queued broadcasts ----
+wss = new WebSocketServer({ server, perMessageDeflate: false });
+wsReady = true;
 
 // ===== Sweep/Block thresholds =====
 const MIN_SWEEP_QTY       = Number(process.env.MIN_SWEEP_QTY || 50);     // contracts
@@ -151,6 +199,7 @@ const AUTOTRADE = {
 };
 
 async function getATRForUnderlying(ul, len = AUTOTRADE.atrLen) {
+  if (isFutures(ul)) return getATRForFutures(futRoot(ul), len);
   const cached = ATR_CACHE.get(ul);
   const now = Date.now();
   if (cached && (now - cached.lastCalcTs) < 60_000) return cached.atr; // 1-min reuse
@@ -222,6 +271,19 @@ function isHighConviction(msg) {
   return true;
 }
 async function resolveOptConid(ul, expiryISO, right, strike) {
+  // if (isFutures(ul) || /^[A-Z]{1,3}$/.test(ul) && ul.length<=3 && ul===ul.toUpperCase()){ // crude check
+  //   // const root = isFutureSym(ul) ? futRoot(ul) : ul;
+  //   // const active = ACTIVE_FUT.get(root) || await ibActiveFuture(root);
+  //   // if (!active) return null;
+  //   // const month = expiryISO.replace(/-/g,"").slice(0,6); // YYYYMM
+  //   // return resolveFOPConid(root, active.conid, month, right, strike);
+  //   return resolveFopConid(ul, expiryISO, right, strike)
+  // }  
+  if (isFutures(ul)) {
+    // normalize to root ("/ES" -> "ES") before calling
+    const root = futRoot(ul);
+    return resolveFopConid(root, expiryISO, right, strike);
+  }  
   const yyyy = expiryISO.slice(0,4), mm = expiryISO.slice(5,7);
   const month = `${yyyy}${mm}`;
   const conid = await ibConidForSymbol(ul);
@@ -244,7 +306,7 @@ async function ibPlaceOptionOrder({ optConid, action, qty, lmtPrice }) {
     side: action,
     quantity: qty,
     type: AUTOTRADE.orderType === "LMT" ? "LMT" : "MKT",
-    tif: "DAY",
+    tif: "GTC",
     outsideRth: true,
     ...(AUTOTRADE.orderType === "LMT" && Number.isFinite(lmtPrice) ? { lmtPrice: +lmtPrice } : {}),
   };
@@ -266,75 +328,31 @@ function computeMidFromNBBO(occ) {
   if (q && q.bid > 0 && q.ask > q.bid) return (q.bid + q.ask) / 2;
   return undefined;
 }
-// async function autoTradeOnFlow(msg, underPx) {
-//   if (!AUTOTRADE.enabled) return;
-//   if (OPEN_COUNT >= AUTOTRADE.maxOpenPositions) return;
-//   if (!isHighConviction(msg)) return;
 
-//   const ul = msg.ul;
-//   const right = msg.right;    // "C" | "P"
-//   const strike = Number(msg.strike);
-//   const expiry = msg.expiry;  // "YYYY-MM-DD"
-//   const action = String(msg.action || "").toUpperCase(); // BTO/BTC/STO/STC
-//   const occ = toOcc(ul, expiry, rightToCP(right), strike);
+// ---------- Optional: reuse around-ATM builder elsewhere ----------
+function buildOptionsAroundATM(sym, getLastFn, around = 10) {
+  const s = String(sym).toUpperCase();
+  const last = typeof getLastFn === "function" ? getLastFn(s) : refPrice(s);
+  if (!Number.isFinite(last)) return [];
 
-//   // Map action -> trading direction for "same option"
-//   // BUY to open -> BUY; SELL to open -> SELL (short); close actions are ignored by default
-//   let dir;
-//   if (action === "BTO") dir = "BUY";
-//   else if (action === "STO") dir = "SELL";
-//   else return; // ignore BTC/STC (closing) by default; you can flip this if desired.
+  const step = stepFor(s);
+  const atm  = roundToStep(last, step);
+  const scheme = isFutureSymbol(s) ? "futures" : "equity";
 
-//   if (dir === "SELL" && !AUTOTRADE.allowShortOptions) {
-//     // Defined-risk alternative: skip OR convert to long the opposite (commented).
-//     // return;
-//     // Example conversion (optional): mirror bearish STO Call with long Put, and bullish STO Put with long Call
-//     // dir = "BUY";
-//     // right = (right === "C" ? "P" : "C");
-//   }
+  // next 2 expiries by scheme
+  const expiries = [nearestExpiry(0, scheme), nearestExpiry(7, scheme)];
 
-//   const atr = await getATRForUnderlying(ul, AUTOTRADE.atrLen);
-//   if (!Number.isFinite(atr)) return;
+  const out = [];
+  for (const expiration of expiries) {
+    for (let i = -around; i <= around; i++) {
+      const strike = +(atm + i * step).toFixed(2);
+      out.push({ underlying: s, expiration, strike, right: "C" });
+      out.push({ underlying: s, expiration, strike, right: "P" });
+    }
+  }
+  return dedupeOptions(out);
+}
 
-//   // Resolve conid
-//   const optConid = await resolveOptConid(ul, expiry, right, strike);
-//   if (!optConid) return;
-
-//   // Price for LMT (mid) if needed
-//   const mid = computeMidFromNBBO(occ);
-
-//   // Place order
-//   const qty = AUTOTRADE.fixedQty;
-//   const r = await ibPlaceOptionOrder({
-//     optConid,
-//     action: dir,
-//     qty,
-//     lmtPrice: mid,
-//   });
-//   if (!r) return;
-
-//   // Record position w/ ATR stops based on 'underPx' (current underlying)
-//   const entryUnderPx = underPx;
-//   const posId = `${occ}#${Date.now()}`;
-//   const trailOffset = AUTOTRADE.trailATR * atr;
-
-//   // Trail baseline depends on bullish vs bearish
-//   const bullish = (right === "C"); // long call usually wants underlying up; short call wants underlying down—but we trail by direction of PnL on underlying
-//   const dirSign = (dir === "BUY") ? (bullish ? +1 : -1)  // long call: +1, long put: -1
-//                                   : (bullish ? -1 : +1); // short call: -1, short put: +1
-//   const trailLine = entryUnderPx - dirSign * trailOffset; // initial trail (behind favorable direction)
-
-//   POSITIONS.set(posId, {
-//     occ, ul, right, strike, dir, qty,
-//     optConid,
-//     entryUnderPx,
-//     atr,
-//     trailLine,     // updated as price moves favorably
-//     openedAt: Date.now(),
-//   });
-//   OPEN_COUNT++;
-//   console.log("[AUTOTRADE] Opened", posId, dir, occ, "ATR=", atr.toFixed(3));
-// }
 async function autoTradeOnFlow(msg, underPx) {
   try {
     if (!AUTOTRADE?.enabled) return;
@@ -444,6 +462,9 @@ async function autoTradeOnFlow(msg, underPx) {
     console.warn("[AUTOTRADE] autoTradeOnFlow error:", e?.message || e);
   }
 }
+// Real-time last price cache: lastBySymbol["SPY"] = 504.23, etc.
+const lastBySymbol = Object.create(null);
+
 async function evaluateStopsOnTick(ul, px) {
   if (!AUTOTRADE.enabled || POSITIONS.size === 0) return;
 
@@ -534,8 +555,6 @@ async function ibConidForOption(ul, expiry, right, strike) {
   const hit = cacheOptConid.get(key);
   if (hit?.conid && (Date.now() - hit.ts) < OPTION_CONID_TTL_MS) return hit.conid;
 
-  // 1) Try a direct secdef search by OCC-like local symbol if IB recognizes it.
-  // Some IB deployments allow searching the OCC-style localSymbol; if not found, we fallback.
   const occLocal = (() => {
     const root = (String(ul).toUpperCase() + "      ").slice(0, 6);
     const yymmdd = String(expiry).replace(/-/g,"").slice(2,8);
@@ -583,6 +602,10 @@ async function ibConidForOption(ul, expiry, right, strike) {
     return out;
   } catch { return null; }
 }
+const getLast = (sym) => {
+  const v = lastBySymbol[sym?.toUpperCase()?.replace(/^\//, "")];
+  return Number.isFinite(v) ? v : null;
+};
 async function buildNearATMOptionConidsForUL(ul) {
   const rows = [];
   const spot = getUnderlyingLastNear(ul, Date.now()) ?? getLast(ul);
@@ -647,128 +670,137 @@ function maybePublishSweepOrBlock(msg) {
 
   pushAndFanout({ type: isBlock ? "blocks" : "sweeps", ...base });
 }
-// function maybePublishSweepOrBlock(msg) {
-//   // msg is an options_ts-like object: { symbol, option:{expiration,strike,right}, price, qty, side, ... }
-//   const notional = Math.round((msg.qty * (msg.price || 0) * 100));
-//   const isSweep  = msg.qty >= MIN_SWEEP_QTY && notional >= MIN_SWEEP_NOTIONAL;
-//   const isBlock  = msg.qty >= MIN_BLOCK_QTY  && notional >= MIN_BLOCK_NOTIONAL;
-
-//   if (!isSweep && !isBlock) return;
-
-//   // Build a stable-ish key to de-dupe mirrored spam
-//   const k = [
-//     msg.symbol, msg.option?.right, msg.option?.strike, msg.option?.expiration,
-//     msg.side, Math.round(msg.price*1000)||0
-//   ].join("|");
-
-//   if (seenRecently(k, DEDUP_MS)) return;
-
-//   // classify aggressor vs mid for display
-//   let aggressor = "UNKNOWN";
-//   const bid = msg.nbbo?.bid ?? (NBBO_OPT.get(toOcc(msg.symbol, msg.option?.expiration, msg.option?.right, msg.option?.strike))?.bid);
-//   const ask = msg.nbbo?.ask ?? (NBBO_OPT.get(toOcc(msg.symbol, msg.option?.expiration, msg.option?.right, msg.option?.strike))?.ask);
-//   if (Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 && ask > 0) {
-//     const mid = (bid + ask) / 2;
-//     const bps = ((msg.price - mid) / mid) * 1e4;
-//     aggressor = bps >= TAPE_CFG.sweep.atAskBps ? "AT_ASK" : (bps <= -TAPE_CFG.sweep.atAskBps ? "AT_BID" : "NEAR_MID");
-//   }
-
-//   const base = {
-//     id: `${Date.now()}-${Math.random().toString(36).slice(2,8)}`,
-//     ts: Date.now(),
-//     provider: "ibkr",
-//     symbol: msg.symbol,
-//     right: msg.option?.right,
-//     strike: msg.option?.strike,
-//     expiry: msg.option?.expiration,
-//     side: msg.side,
-//     qty: msg.qty,
-//     price: msg.price,
-//     bid,
-//     ask,
-//     aggressor,  // AT_ASK / AT_BID / NEAR_MID / UNKNOWN
-//     notional,
-//   };
-
-//   if (isBlock) {
-//     pushAndFanout({ type: "blocks", ...base });
-//   } else if (isSweep) {
-//     pushAndFanout({ type: "sweeps", ...base });
-//   }
-// }
 
 if (!global.STATE) global.STATE = {};
 if (!STATE.watchlist) STATE.watchlist = { equities: [], options: [] };
+// 1) Single source of truth
+// ---------- seed ----------
+if (!STATE.watchlist) STATE.watchlist = { equities: [], options: [] };
 
-/* ================= SEED & START ================= */
-// const DEFAULT_EQUITIES = (process.env.DEFAULT_EQUITIES || "AAPL,NVDA,MSFT,SPY").split(",")
-//   .map(s => s.trim().toUpperCase()).filter(Boolean);
+// 1) Single source of truth
+// const EQUITIES = ["SPY", "AAPL", "NVDA", "SPX", "/ES", "/NQ", "/YM"]; // what you want in equity_ts
+// const OPTIONABLE = new Set(["SPY", "AAPL", "NVDA", "SPX", "/ES", "/NQ", "/YM"]); // your provider supports
+const EQUITIES = ["/ES", "/NQ"]; // what you want in equity_ts
+const OPTIONABLE = new Set(["/ES", "/NQ"]); // your provider supports
 
-// const DEFAULT_EQUITIES = (process.env.DEFAULT_EQUITIES || "SPY,QQQ,IWM,AAPL,NVDA,MSFT,SPX,ES");
-// const DEFAULT_EQUITIES = (process.env.DEFAULT_EQUITIES || "SPY,QQQ,IWM,AAPL,NVDA,MSFT,SPX,ES")
-//   .split(",")
-//   .map(s => s.trim().toUpperCase())
-//   .filter(Boolean);
-const POPULAR_50 = [
-  "SPY"// ,"QQQ","IWM","DIA","SPX","ES"
-  // ,"TLT","HYG","GLD","SLV","GDX","USO",
-  // "AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA","AVGO","AMD","NFLX","SMCI","MU","TSM","INTC","CSCO","IBM","ORCL","CRM",
-  // "JPM","BAC","WFC","MS","GS","V","MA","PYPL","SQ","COIN",
-  // "XOM","CVX","COP","OXY",
-  // "UNH","JNJ","MRK","PFE","COST","HD","DIS"
-];
+const OPTION_UNDERLYINGS = EQUITIES.filter(s => OPTIONABLE.has(s)); // derive
 
-const SEED_ON_EMPTY = String(process.env.SEED_ON_EMPTY || "").trim() === "1";
-// const DEFAULT_EQUITIES =
-//   (process.env.DEFAULT_EQUITIES || POPULAR_50.join(","))
-//     .split(",")
-//     .map(s => s.trim().toUpperCase())
-//     .filter(Boolean);
-// DEFAULT_EQUITIES only used for DEMO/SEED paths (not for normal boot)
-const DEFAULT_EQUITIES = (process.env.DEFAULT_EQUITIES || POPULAR_50.join(","))
-  .split(",")
-  .map(s => s.trim().toUpperCase())
-  .filter(Boolean);
- 
-// during startup, if your in-mem watchlist is empty:
-// if (WATCH.equities.size === 0) {
-//   DEFAULT_EQUITIES.forEach(s => addEquity(s));
-//   // optionally persist
-// }
-// ---- Do NOT auto-seed on normal boot ----
-// If you really want to seed when empty, set SEED_ON_EMPTY=1
-const SEED_MARK = ""; // disable any seed guard logic downstream
+// ---------- date helpers ----------
+const toISO = d => new Date(d.getTime() - d.getTimezoneOffset()*60000).toISOString().slice(0, 10);
+const addDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); return x; };
 
-if (SEED_ON_EMPTY && (WATCH.equities.size === 0) && !fs.existsSync(SEED_MARK)) {
-  (async () => {
-    for (const s of DEFAULT_EQUITIES) await addEquity(s);
-    fs.writeFileSync(SEED_MARK, new Date().toISOString());
-    // wsBroadcast("watchlist", getWatchlist());
-    wsBroadcast("watchlist", makeWatchlistPayload());
-    console.log("[seed] SEED_ON_EMPTY applied");
-  })();
+function nextWeekdayOnOrAfter(startDate, weekdays) {
+  const want = new Set(weekdays);
+  const d = new Date(startDate);
+  for (let i = 0; i < 28; i++) {
+    if (want.has(d.getDay())) return toISO(d);
+    d.setDate(d.getDate() + 1);
+  }
+  return toISO(d);
 }
-// const POPULAR_50 = [
-//   // ETFs & index/future
-//   "SPY","QQQ","IWM","DIA","TLT","HYG","GLD","SLV","GDX","USO","SPX","ES",
-//   // Mega-cap tech + semis
-//   "AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA","AVGO","AMD","NFLX","SMCI","MU","TSM","INTC","CSCO","IBM","ORCL","CRM",
-//   // Fin/Payments
-//   "JPM","BAC","WFC","MS","GS","V","MA","PYPL","SQ","COIN",
-//   // Energy
-//   "XOM","CVX","COP","OXY",
-//   // Health / Staples / Retail / Discretionary
-//   "UNH","JNJ","MRK","PFE","COST","HD","DIS"
-// ];
 
-// // const DEFAULT_EQUITIES = (process.env.DEFAULT_EQUITIES || "SPY,QQQ,IWM,AAPL,NVDA,MSFT,SPX,ES")
-// //   .split(",")
-// //   .map(s => s.trim().toUpperCase())
-// //   .filter(Boolean);
-// const DEFAULT_EQUITIES = (process.env.DEFAULT_EQUITIES || POPULAR_50.join(","))
-//   .split(",")
-//   .map(s => s.trim().toUpperCase())
-//   .filter(Boolean);
+// ---------- expiry pickers ----------
+function nearestExpiry(days = 0, scheme = "equity") {
+  const start = addDays(new Date(), days);
+  const weekdays = (scheme === "futures") ? [1, 3, 5] : [5]; // Mon/Wed/Fri vs Fri
+  return nextWeekdayOnOrAfter(start, weekdays);
+}
+
+// ---------- symbol / price step helpers ----------
+function isFutureSymbol(sym) {
+  if (!sym) return false;
+  const s = String(sym).toUpperCase();
+  if (s.startsWith("/")) return true;         // /ES, /NQ, ...
+  const FUTS = new Set(["ES","NQ","RTY","YM","CL","GC","SI","ZN","ZB","ZF","ZT","HG","NG"]);
+  return FUTS.has(s);
+}
+const FUTS_ALIASES = new Map([
+  // choose ONE canonical — here we canonicalize to "/ES", "/NQ", "/YM"
+  ["ES", "/ES"], ["/ES", "/ES"],
+  ["NQ", "/NQ"], ["/NQ", "/NQ"],
+  ["YM", "/YM"], ["/YM", "/YM"],
+  // add others as needed
+]);
+
+// export function normalizeSymbol(s) {
+//   if (!s) return "";
+//   const t = String(s).trim().toUpperCase();
+//   return FUTS_ALIASES.get(t) ?? t;
+// }
+
+function stepFor(sym) {
+  const s = String(sym).toUpperCase();
+  if (s === "SPX") return 1;          // whole-dollar strikes
+  if (s === "SPY") return 1;          // $1 strikes near ATM
+  if (s === "QQQ" || s === "IWM") return 1;
+  if (isFutureSymbol(s)) {
+    // very rough defaults; adjust to your venue:
+    if (s.includes("ES")) return 5;   // ES options $5 strikes
+    if (s.includes("NQ")) return 10;  // NQ options $10 strikes
+    if (s.includes("YM")) return 5;
+    return 5;
+  }
+  return 1;
+}
+
+function roundToStep(value, step) {
+  return Math.round(value / step) * step;
+}
+
+// Fallback ref price (replace with your own cache/NBBO)
+function refPrice(sym) {
+  const s = String(sym).toUpperCase();
+  if (typeof getLast === "function") {
+    const px = getLast(s);
+    if (Number.isFinite(px)) return px;
+  }
+  // last resort: look in a cache you maintain
+  if (STATE && STATE.last && Number.isFinite(STATE.last[s])) return STATE.last[s];
+  return NaN;
+}
+
+function dedupeOptions(rows) {
+  const seen = new Set();
+  const out = [];
+  for (const r of rows) {
+    const key = `${r.underlying}|${r.expiration}|${r.strike}|${r.right}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(r);
+  }
+  return out;
+}
+
+// ---------- build a thin options list (nearest expiries/strikes) ----------
+function makeOptionList(underlyings, { dte = [1, 7], strikes = 61 } = {}) {
+  const out = [];
+  for (const ul of underlyings) {
+    const scheme = isFutureSymbol(ul) ? "futures" : "equity";  // FIX: use `ul` not `sym`
+    const step = stepFor(ul);
+    const center = refPrice(ul);
+    if (!Number.isFinite(center)) continue;
+
+    for (const days of dte) {
+      const expiry = nearestExpiry(days, scheme);
+      for (let k = -Math.floor(strikes / 2); k <= Math.floor(strikes / 2); k++) {
+        const strike = roundToStep(center + k * step, step);
+        out.push({ underlying: ul, expiration: expiry, strike, right: "C" });
+        out.push({ underlying: ul, expiration: expiry, strike, right: "P" });
+      }
+    }
+  }
+  return dedupeOptions(out);
+}
+
+// ---------- watchlist payload + broadcast ----------
+const WATCHLIST = {
+  equities: EQUITIES,
+  options: makeOptionList(OPTION_UNDERLYINGS, { dte: [1, 8], strikes: 61 })
+};
+
+// IMPORTANT: your wsBroadcast is (topic, data)
+// wsBroadcast("watchlist", WATCHLIST);
+
 
 function toNumStrict(x) {
   if (typeof x === "number" && Number.isFinite(x)) return x;
@@ -783,13 +815,6 @@ function normalizeIv(ivRaw) {
   return n <= 1.5 ? Math.round(n * 100) : Math.round(n);
 }
 
-// const DEFAULT_OPTIONS = (process.env.DEFAULT_OPTIONS || "").trim()
-//   ? JSON.parse(process.env.DEFAULT_OPTIONS)
-//   : [
-//       { underlying: "AAPL", expiration: "2025-12-19", strike: 200, right: "C" },
-//       { underlying: "NVDA", expiration: "2025-12-19", strike: 150, right: "P" },
-//     ];
-// const SEED_MARK = ".seeded";
 const DEFAULT_OPTIONS = (process.env.DEFAULT_OPTIONS || "").trim()
   ? JSON.parse(process.env.DEFAULT_OPTIONS)
   : []; // no demo seeds
@@ -799,36 +824,90 @@ const CONID_TTL_MS = 12*60*60*1000;
 const EXP_TTL_MS   = 30*60*1000;
 
 let lastReqEndedAt = 0;
-// function seedWatchlist() {
-//   // equities
-//   const existing = new Set((STATE.watchlist.equities || []).map(s => s.toUpperCase()));
-//   for (const s of DEFAULT_EQUITIES) existing.add(s.toUpperCase());
-//   STATE.watchlist.equities = Array.from(existing);
 
-//   // options (read-only demo list)
-//   STATE.watchlist.options = Array.isArray(STATE.watchlist.options) && STATE.watchlist.options.length
-//     ? STATE.watchlist.options
-//     : DEFAULT_OPTIONS.slice();
-
-//   console.log("Seeded equities:", STATE.watchlist.equities.join(", "));
-//   // console.log("Seeded demo options:", STATE.watchlist.options.map(o => `${o.ul} ${o.right} ${o.strike} ${o.expiry}`).join(" | "));
-//   console.log(
-//     "Seeded demo options:",
-//     (STATE.watchlist.options || [])
-//       .map(o => `${o.underlying} ${o.right} ${o.strike} ${o.expiration}`)
-//       .join(" | ")
-//   );
-// }
-let wss = /** @type {import('ws').WebSocketServer|null} */ (null);
-let wsReady = false;
 const WS_QUEUE = []; // payloads buffered until WS is ready
+
+const FUT_EXCH = "GLOBEX";
+
+function isFutureSym(s) { return typeof s === "string" && s.trim().startsWith("/"); }
+function futRoot(s)     { return s.replace(/^\//, "").toUpperCase(); } // "/ES" -> "ES"
+
+const ACTIVE_FUT = new Map(); // key: "ES" -> { conid, symbol: "ESZ5", ymd: "2025-12-??" }
+
+async function ibActiveFuture(root){ // pick the front/active contract
+  // Option A (simple/robust): search secdefs and pick nearest-dated GLOBEX future
+  const q = await ibFetchJson(`${IB_BASE}/iserver/secdef/search?symbol=${root}&sectype=FUT&exchange=${FUT_EXCH}`);
+  const arr = Array.isArray(q) ? q : (q ? [q] : []);
+  // Filter to tradingClass === root and has conid & maturity
+  const futs = arr.filter(x => x?.conid && x?.exchange === FUT_EXCH && (x?.tradingClass === root || x?.symbol === root));
+  // Pick the nearest maturity (YYYYMM format lives in x?.months or x?.maturity)
+  futs.sort((a,b) => (a.maturity||"").localeCompare(b.maturity||""));
+  const best = futs[0];
+  if (!best) return null;
+
+  // Resolve snapshot to be safe
+  ACTIVE_FUT.set(root, { conid: best.conid, symbol: best.localSymbol || best.symbol, maturity: best.maturity });
+  return ACTIVE_FUT.get(root);
+}
+// Make a unique key for cache/nbbo – futures options don't have OCC; make our own
+function toFopKey(root, futMaturityYYYYMM, optYYYYMMDD, rightCP, strike){
+  return `${root} ${futMaturityYYYYMM} FOP ${optYYYYMMDD} ${rightCP} ${String(strike)}`;
+}
+
+async function resolveFopConid(ulOrRoot, expiryISO, right, strike) {
+  const root = futRoot(ulOrRoot); // "/ES" -> "ES"
+
+  // Use your front-month resolver so we’re anchored to the correct FUT
+  const active = ACTIVE_FUT.get(root) || await ibActiveFuture(root);
+  const futConid = active?.conid;
+  if (!futConid) return null;
+
+  const month = expiryISO.slice(0,4) + expiryISO.slice(5,7); // YYYYMM
+
+  // FOP lives on GLOBEX
+  const url = `${IB_BASE}/iserver/secdef/info?conid=${futConid}` +
+              `&sectype=FOP&month=${month}&exchange=GLOBEX&right=${right}&strike=${strike}`;
+  const info = await ibFetchJson(url);
+  const arr  = Array.isArray(info) ? info
+             : Array.isArray(info?.Contracts) ? info.Contracts
+             : info ? [info] : [];
+  return arr.find(x => x?.conid)?.conid || null;
+}
+async function getFuturesUnderPx(root){
+  const active = ACTIVE_FUT.get(root) || await ibActiveFuture(root);
+  if (!active) return undefined;
+  const snap = await ibFetchJson(`${IB_BASE}/iserver/marketdata/snapshot?conids=${active.conid}&fields=31`);
+  return Number(Array.isArray(snap) && snap[0] && snap[0]["31"]);
+}
+
+async function getATRForFutures(root, len=14){
+  const active = ACTIVE_FUT.get(root) || await ibActiveFuture(root);
+  if (!active) return undefined;
+  const hist = await ibFetchJson(`${IB_BASE}/iserver/marketdata/history?conid=${active.conid}&period=2w&bar=1day&outsideRth=true`);
+  const bars = hist?.data || hist?.points || hist?.bars || [];
+  // compute ATR classic
+  const trs = [];
+  for (let i=1;i<bars.length;i++){
+    const h = +bars[i].h ?? +bars[i].high, l = +bars[i].l ?? +bars[i].low, c1 = +bars[i-1].c ?? +bars[i-1].close;
+    if (!Number.isFinite(h) || !Number.isFinite(l) || !Number.isFinite(c1)) continue;
+    trs.push(Math.max(h-l, Math.abs(h-c1), Math.abs(l-c1)));
+  }
+  if (!trs.length) return undefined;
+  const n = Math.min(len, trs.length);
+  return trs.slice(-n).reduce((a,b)=>a+b,0)/n;
+}
+function esStrikeGrid(underPx){
+  const grid = 5; // ES FOP strikes
+  const atm  = Math.round(underPx / grid) * grid;
+  return [-2,-1,0,1,2].map(i => atm + i*grid);
+}
 
 // Dedup + burst-friendly broadcast
 function flushOptionQuotes() {
   if (!optionQuoteBuf.size) return;
   const data = Array.from(optionQuoteBuf.values());
   optionQuoteBuf.clear();
-  wsBroadcast({ topic: "option_quotes", data });
+  wsBroadcast("option_quotes", data);
 }
 setInterval(flushOptionQuotes, OPTION_QUOTES_FLUSH_MS);
 
@@ -869,7 +948,23 @@ function occFromParts(ul, expiry, right, strike) {
 
 function num(v) { const n = Number(v); return Number.isFinite(n) ? n : undefined; }
 function normUL(x) { return String(x || "").trim().toUpperCase(); }
-// Convert provider trade → normalized object with at/action/mark fields
+function toOptKey({ occWire, ul, expiry, right, strike }) {
+  try {
+    if (typeof optKey === "function") {
+      if (occWire && typeof parseOCC === "function") {
+        const p = parseOCC(occWire); // -> { ul, expiry, right, strike }
+        if (p && p.ul && p.expiry && p.right && Number.isFinite(p.strike)) {
+          return optKey(p.ul, p.expiry, p.right, p.strike);
+        }
+      }
+      if (ul && expiry && right && Number.isFinite(strike)) {
+        return optKey(ul, expiry, right, strike);
+      }
+    }
+  } catch (_) {}
+  return occWire; // graceful fallback
+}
+
 function normalizeOptionTrade(raw) {
   const ul     = normUL(raw.ul || raw.underlying || raw.ul_symbol || raw.symbol || raw.root || raw.underlyingSymbol);
   const rightR = String(raw.right || raw.r || "").toUpperCase();
@@ -879,31 +974,43 @@ function normalizeOptionTrade(raw) {
   const qty    = num(raw.qty ?? raw.size ?? raw.quantity) || 0;
   const price  = num(raw.price ?? raw.px ?? raw.last ?? raw.trade_price ?? raw.bid ?? raw.ask) || 0;
 
+  // canonical right first (needed for keys)
+  const right  = (rightR === "C" || rightR === "CALL") ? "CALL" : "PUT";
+
   // book
   const bid = num(raw.bid);
   const ask = num(raw.ask);
-  const mid = Number.isFinite(bid) && Number.isFinite(ask) ? (bid + ask) / 2 : num(raw.mid);
+  const mid = (Number.isFinite(bid) && Number.isFinite(ask)) ? (bid + ask) / 2 : num(raw.mid);
+
+  // OCC wire & built
+  const occWire  = raw.occ || undefined;
+  const occBuilt = (ul && expiry && Number.isFinite(strike) && right)
+    ? occFromParts(ul, expiry, right, strike)
+    : undefined;
+  const occHuman = occWire || occBuilt;
+
+  // opaque option key for inference/caching
+  const occKey = toOptKey({ occWire, ul, expiry, right, strike });
 
   // compute 'at' and inference
-  const occ = raw.occ || occFromParts(ul, expiry, rightR, strike);
   const info = inferActionForOptionTrade({
-    occ,
+    occ: occKey,                                   // opaque id expected by infer*
     qty,
     price,
-    side: sideR,                              // BUY/SELL expected
-    book: { bid, ask, mid },
+    side: sideR,                                   // BUY/SELL expected
+    book: {
+      bid: Number.isFinite(bid) ? bid : undefined,
+      ask: Number.isFinite(ask) ? ask : undefined,
+      mid: Number.isFinite(mid) ? mid : undefined
+    },
     cumulativeVol: num(raw.volume ?? raw.day_volume), // if your feed sends cumulative day volume
     oi: num(raw.oi),
     asOfYMD: asOfYMD()
   });
 
-  const right = (rightR === "C" || rightR === "CALL") ? "CALL" : "PUT";
-
   // UL price at trade time (if given), else last known
   const ul_px = num(raw.ul_px ?? raw.underlyingPrice ?? raw.underlying_last);
   if (ul && Number.isFinite(ul_px)) seedUL(ul, ul_px);
-
-  // If you’re also receiving live UL quotes elsewhere, remember to seedUL there too.
 
   return {
     ul,
@@ -917,11 +1024,11 @@ function normalizeOptionTrade(raw) {
     prints: num(raw.prints ?? raw.parts) || 1,
     ts: num(raw.ts ?? raw.time) || Date.now(),
 
-    occ,
+    occ: occHuman,                                  // keep human-friendly OCC for UI/debug
     bid, ask, mid,
-    at: info.at,                   // "bid" | "ask" | "mid" | "between"
-    action: info.action,           // "BTO" | "BTC" | "STO" | "STC" | ...
-    action_conf: info.action_conf, // "high" | "medium" | "low"
+    at: info.at,                                    // "bid" | "ask" | "mid" | "between"
+    action: info.action,                            // "BTO" | "BTC" | "STO" | "STC" | ...
+    action_conf: info.action_conf,                  // "high" | "medium" | "low"
     reason: info.reason,
 
     oi: num(raw.oi) ?? null,
@@ -930,16 +1037,37 @@ function normalizeOptionTrade(raw) {
     ul_px: Number.isFinite(ul_px) ? ul_px : (ul ? latestUL.get(ul) : undefined)
   };
 }
+// function publishFlow(topic, rawRows) {
+//   const rows = (Array.isArray(rawRows) ? rawRows : [rawRows]).map(normalizeOptionTrade);
+
+//   // seed UL map from payloads & attach a small ul_prices map so clients can backfill
+//   const ul_prices = {};
+//   for (const r of rows) {
+//     if (r.ul && Number.isFinite(r.ul_px)) ul_prices[r.ul] = r.ul_px;
+//     else if (r.ul && latestUL.has(r.ul))  ul_prices[r.ul] = latestUL.get(r.ul);
+//   }
+//   wsBroadcast({ topic, data: rows, ul_prices });
+// }
+
+// // convenience wrappers
+// export function publishBlocks(rawRows) { publishFlow("blocks", rawRows); }
+// export function publishSweeps(rawRows) { publishFlow("sweeps", rawRows); }
+// export function publishPrints(rawRows) { publishFlow("prints", rawRows); }
 function publishFlow(topic, rawRows) {
   const rows = (Array.isArray(rawRows) ? rawRows : [rawRows]).map(normalizeOptionTrade);
 
   // seed UL map from payloads & attach a small ul_prices map so clients can backfill
   const ul_prices = {};
   for (const r of rows) {
-    if (r.ul && Number.isFinite(r.ul_px)) ul_prices[r.ul] = r.ul_px;
-    else if (r.ul && latestUL.has(r.ul))  ul_prices[r.ul] = latestUL.get(r.ul);
+    if (r.ul && Number.isFinite(r.ul_px)) {
+      ul_prices[r.ul] = r.ul_px;
+    } else if (r.ul && latestUL.has(r.ul)) {
+      ul_prices[r.ul] = latestUL.get(r.ul);
+    }
   }
-  wsBroadcast({ topic, data: rows, ul_prices });
+
+  // send as { topic, data: { rows, ul_prices } }
+  wsBroadcast(topic, { rows, ul_prices });
 }
 
 // convenience wrappers
@@ -957,57 +1085,6 @@ function wsBroadcast(topic, data) {
   for (const c of wss.clients) if (c.readyState === 1) c.send(payload);
 }
 const DEMO = String(process.env.DEMO || "").trim() === "1";
-async function seedWatchlist() {
-  // Only seed in explicit DEMO mode
-  const envList = (process.env.DEFAULT_EQUITIES || "").trim();
-  const desired = (envList ? envList.split(",") : POPULAR_50)
-    .map(s => s.trim().toUpperCase())
-    .filter(Boolean);
-  for (const s of desired) await addEquity(s);
-  // Demo-only option legs (optional)
-  // if (!Array.isArray(WATCH.options) || WATCH.options.length === 0) {
-  //   await addOptions([
-  //     { underlying: "AAPL", expiration: "2025-12-19", strike: 200, right: "C" },
-  //     { underlying: "NVDA", expiration: "2025-12-19", strike: 150, right: "P" },
-  //   ]);
-  // }
-  // if (DEMO && (!Array.isArray(WATCH.options) || WATCH.options.length === 0)) {
-  //   await addOptions([
-  //     { underlying: "AAPL", expiration: "2025-12-19", strike: 200, right: "C" },
-  //     { underlying: "NVDA", expiration: "2025-12-19", strike: 150, right: "P" },
-  //   ]);
-  // }  
-  // wsBroadcast("watchlist", getWatchlist());
-  wsBroadcast("watchlist", makeWatchlistPayload());
-}
-
-// async function seedWatchlist() {
-//   // const DEFAULT_EQUITIES = (process.env.DEFAULT_EQUITIES || "SPY,QQQ,IWM,AAPL,NVDA,MSFT,SPX,ES")
-//   //   .split(",").map(s => s.trim().toUpperCase()).filter(Boolean);
-
-//   // for (const s of DEFAULT_EQUITIES) addEquity(s);
-//   const envList = (process.env.DEFAULT_EQUITIES || "").trim();
-//   const desired = (envList ? envList.split(",") : POPULAR_50)
-//     .map(s => s.trim().toUpperCase()).filter(Boolean);
-//   for (const s of desired) addEquity(s);
-
-//   if (!(WATCH.options?.length)) {
-//     addOptions([
-//       { underlying: "AAPL", expiration: "2025-12-19", strike: 200, right: "C" },
-//       { underlying: "NVDA", expiration: "2025-12-19", strike: 150, right: "P" },
-//     ]);
-//   }
-//   wsBroadcast("watchlist", getWatchlist());
-// }
-
-// seedWatchlist();
-
-
-const server = http.createServer(app);
-
-// ---- Create WS server, then mark ready and flush any queued broadcasts ----
-wss = new WebSocketServer({ server, perMessageDeflate: false });
-wsReady = true;
 setBroadcaster(wsBroadcast);
 // Kickoff loops (tune cadences as desired)
 async function startIBLoops() {
@@ -1018,38 +1095,59 @@ async function startIBLoops() {
 
   // Pollers
   setInterval(() => { pollEquitiesOnce().catch(()=>{}); }, 1_500);  // ~0.7 Hz
-  setInterval(() => { pollOptionsOnce().catch(()=>{});  }, 2_500);  // ~0.4 Hz
+  setInterval(() => { pollOptionsOnce().catch(()=>{});  }, 1_500);  // ~0.4 Hz
 
   // Your existing synthesizer timers are already running (every 1s / 5s)
   console.log("[IB] loops started.");
 }
+// Refresh NBBO for all known option keys without rebuilding chains
+async function refreshOptionNBBOFast() {
+  try {
+    // Collect known option keys → conids we already resolved
+    const keys = Array.from(NBBO_OPT.keys());
+    if (!keys.length) return;
+
+    // If you cached conids per key, use that. If not, skip (still safe).
+    const conids = [];
+    for (const k of keys) {
+      const meta = cacheOptConid.get?.(k) || null; // if you put occ→conid here
+      if (meta?.conid) conids.push(meta.conid);
+    }
+    if (!conids.length) return;
+
+    const snaps = await ibFetch(`/iserver/marketdata/snapshot?conids=${encodeURIComponent(conids.join(","))}&fields=84,86`);
+    const arr = Array.isArray(snaps) ? snaps : [];
+    const byConid = new Map(arr.map(r => [String(r.conid), r]));
+
+    for (const k of keys) {
+      const meta = cacheOptConid.get?.(k);
+      if (!meta?.conid) continue;
+      const s = byConid.get(String(meta.conid));
+      if (!s) continue;
+      const bid = Number(s["84"]), ask = Number(s["86"]);
+      if (Number.isFinite(bid) || Number.isFinite(ask)) {
+        NBBO_OPT.set(k, { bid: bid || 0, ask: ask || 0, ts: Date.now() });
+        ingestOptionQuote({
+          occ: k,
+          bid: Number.isFinite(bid) ? bid : undefined,
+          ask: Number.isFinite(ask) ? ask : undefined,
+          mid: (Number.isFinite(bid)&&Number.isFinite(ask)&&bid>0&&ask>0) ? (bid+ask)/2 : undefined,
+          ts: Date.now()
+        });
+      }
+    }
+  } catch (_) {}
+}
+
+// run it at the same cadence as equities
+setInterval(() => { refreshOptionNBBOFast().catch(()=>{}); }, 1_500);
+
 startIBLoops().catch(()=>{});
 // Flush anything that tried to broadcast before WS stood up
 for (const payload of WS_QUEUE.splice(0)) {
   for (const c of wss.clients) if (c.readyState === 1) c.send(payload);
 }
 
-/* ========== DEMO HELPERS (seed options + normalize prints) ========== */
-// let wss;
-// let wsReady = false;
-// const WS_QUEUE = [];
-// wss = new WebSocketServer({ server, perMessageDeflate:false });
-
-// wsReady = true;
-// flush any pre-init broadcasts
-// for (const p of WS_QUEUE.splice(0)) {
-//   for (const c of wss.clients) if (c.readyState === 1) c.send(p);
-// }
-
-// quick ul price fallback if quotes aren't ready yet
-// const DEMO_BASE = { SPY: 510, QQQ: 430, IWM: 205, AAPL: 268, NVDA: 206, MSFT: 516 };
-
-/** Get an underlying's price from STATE.quotes or a fallback */
-// function getULPrice(ul){
-//   const q = (STATE.quotes && STATE.quotes[ul]) || null;
-//   if (q && typeof q.last === "number" && q.last > 0) return q.last;
-//   return DEMO_BASE[ul] ?? 100;
-// }
 /** Get an underlying's price from STATE.quotes; no demo fallback */
 function getULPrice(ul){
   const q = (STATE.quotes && STATE.quotes[ul]) || null;
@@ -1118,19 +1216,9 @@ function scheduleNotables() {
     const s = JSON.stringify(immediate);
     if (s !== lastNotablesJson) {
       safeBroadcastNotables(immediate.notables || []);
-      // const arr = immediate.notables || [];
-      // wsBroadcast("notables", arr);
-      // lastNotablesJson = s;
     }
   }, 250); // ~4Hz
 }
-// const STATE = {
-//   equities_ts: [],
-//   options_ts:  [],
-//   sweeps:      [],
-//   blocks:      [],
-//   prints:      [],   // <— add this
-// };
 // somewhere near your data ingestion
 const LAST_TRADES = [];          // ring buffer of recent option prints
 const MAX_TRADES  = 5000;
@@ -1154,7 +1242,9 @@ function isOTM(ulPx, right, strike){
 /** central gate: allow only big premium OR OTM with large size */
 function passesPublishGate(msg){
   const notional = Number(msg?.notional);
-  if (Number.isFinite(notional) && notional >= BIG_PREMIUM_MIN) return true;
+  const isFut = (msg.ul||msg.symbol||"").toUpperCase().replace(/^\//,"") === "ES";
+  const premMin = isFut ? Math.max(BIG_PREMIUM_MIN, 250_000) : BIG_PREMIUM_MIN;
+  if (Number.isFinite(notional) && notional >= premMin) return true;
 
   const qty = Number(msg?.qty);
   if (!Number.isFinite(qty) || qty < OTM_QTY_MIN) return false;
@@ -1201,8 +1291,9 @@ const DAY_STATS_OPT = new Map(); // occ -> { volume, oi, ts }
 
 // helper stays near toOcc(...)
 function updateDayStats(ul, expiration, right, strike, { volume, oi }) {
-  const occ = toOcc(ul, expiration, rightToCP(right), strike);
-  DAY_STATS_OPT.set(occ, {
+  // const occ = toOcc(ul, expiration, rightToCP(right), strike);
+  const k = optKey(ul, expiration, rightToCP(right), strike);
+  DAY_STATS_OPT.set(k, {
     volume: Number.isFinite(volume) ? volume : undefined,
     oi: Number.isFinite(oi) ? oi : undefined,
     ts: Date.now()
@@ -1337,26 +1428,6 @@ function seedDemoOptionsFromULs(uls){
   }
   return out;
 }
-// 1) Keep normalizePrint simple but let callers override qty/notional later
-// function normalizePrint(t, kind = "SWEEP"){
-//   const price = Number((t.last ?? t.bid ?? t.ask ?? 1).toFixed(2));
-//   const qty   = 10; // base; will be overridden below
-//   const notional = Number((price * 100 * qty).toFixed(2));
-//   return {
-//     kind: kind.toUpperCase(),           // "SWEEP" | "BLOCK"
-//     ul: t.underlying || "UNKNOWN",
-//     right: t.right === "C" ? "CALL" : "PUT",
-//     strike: t.strike ?? 0,
-//     expiry: t.expiration || "2099-12-31",
-//     side: "BUY",
-//     qty,
-//     price,
-//     notional,
-//     prints: Math.floor(1 + Math.random()*3),
-//     venue: "demo",
-//     ts: Date.now()
-//   };
-// }
 function inferAggressor({ price, bid, ask }) {
   if (typeof price !== "number") return "UNKNOWN";
   if (typeof bid === "number" && price <= bid + 0.01) return "AT_BID";
@@ -1410,18 +1481,6 @@ function normalizePrint(t, kind = "SWEEP") {
 }
 /* ========== INITIAL SEEDING ========== */
 
-// Ensure these are the symbols you already seeded
-// const SEEDED_EQUITIES = ["SPY","QQQ","IWM","AAPL","NVDA","MSFT"];
-
-// Seed options once at startup (and you can call it again after quotes appear)
-// function seedDemoOptions(){
-//   const opts = seedDemoOptionsFromULs(SEEDED_EQUITIES);
-//   STATE.options_ts = opts;
-//   console.log("Seeded demo options:", 
-//     opts.slice(0,4).map(o => `${o.underlying} ${o.right} ${o.strike} ${o.expiration}`).join(" | "),
-//     `(+${Math.max(0, opts.length-4)} more)`
-//   );
-// }
 // server/index.js (or wherever you compute headlines)
 let lastBlocks = "", lastSweeps = "";
 
@@ -1522,13 +1581,6 @@ function seedDemoOptions(){
   console.log("Seeded DEMO options for", uls.length, "symbols");
 }
 
-// function seedDemoOptions(){
-//   const wf = loadWatchlistFile();
-//   const uls = (wf?.equities ?? []).map(s => s.toUpperCase());
-//   const opts = seedDemoOptionsFromULs(uls.length ? uls : DEFAULT_EQUITIES);
-//   STATE.options_ts = opts;
-//   console.log("Seeded demo options for", uls.length, "symbols");
-// }
 let lastHeadlinesJson = "";
 setInterval(() => {
   const headlines = computeHeadlines({ windowMs: ROLLING_MS, minNotional: 50_000, topN: 12 });
@@ -1566,34 +1618,6 @@ function symbolToConid(symbol){
   // fall back to your existing conid cache for equities/indices
   return CACHE.conidBySym.get(symbol)?.conid;
 }
-// Call once during boot
-// seedDemoOptions();
-
-
-/* ========== DEMO TAPES (Sweeps/Blocks) ========== */
-
-// 2) Turn options ticks into demo sweeps/blocks with large enough size
-// function makeDemoTapeFromOptions(optionsTicks, kind){
-//   const out=[];
-//   for (const t of optionsTicks.slice(0, 48)){  // little more depth
-//     const p = normalizePrint(t, kind);
-//     if (kind === "SWEEP"){
-//       // Sweeps: multi-print clusters, medium/large clips
-//       p.prints = Math.floor(2 + Math.random()*3);     // 2-4 prints
-//       p.qty    = Math.floor(50 + Math.random()*200);  // 50-250 contracts
-//       p.price  = Number((p.price || 0.5).toFixed(2));
-//       p.notional = Math.round(p.qty * p.price * 100); // recompute notional
-//     } else {
-//       // Blocks: single big negotiated clip
-//       p.prints = 1;
-//       p.qty    = Math.floor(250 + Math.random()*750); // 250-1000 contracts
-//       p.price  = Number((p.price || 1).toFixed(2));
-//       p.notional = Math.max(150000, Math.round(p.qty * p.price * 100)); // ≥ $150k
-//     }
-//     out.push(p);
-//   }
-//   return out;
-// }
 function makeDemoTapeFromOptions(optionsTicks, kind){
   const out = [];
   const SWEEP_MIN_QTY = 50;     // matches your UI default
@@ -1679,28 +1703,6 @@ async function pollBlocksOnce(){ try {
   if (changed) wsBroadcast("blocks", next);
 } catch(e){ console.warn("pollBlocksOnce:", e.message); } }
 
-// const wss = new WebSocketServer({ server, perMessageDeflate:false });
-
-// function wsSend(ws, topic, data){ try{ ws.send(JSON.stringify({ topic, data })); } catch{} }
-// function wsBroadcast(topic, data){
-//   const s = JSON.stringify({ topic, data });
-//   for (const c of wss.clients) if (c.readyState === 1) c.send(s);
-// }
-// const WS_QUEUE = [];           // payloads to flush when ready
-
-// function wsSend(ws, topic, data){
-//   try { ws.send(JSON.stringify({ topic, data })); } catch {}
-// }
-
-// function wsBroadcast(topic, data){
-//   const payload = JSON.stringify({ topic, data });
-//   if (!wsReady || !wss) { WS_QUEUE.push(payload); return; }
-//   for (const c of wss.clients) if (c.readyState === 1) c.send(payload);
-// }
-
-// const isNonEmptyStr=(s)=>typeof s==="string" && s.trim().length>0;
-// const num=(x)=> (x==null ? undefined : Number(x));
-
 function rightNormalize(x){
   const s = String(x||"").trim().toUpperCase();
   if (s==="CALL"||s==="C") return "C";
@@ -1724,43 +1726,6 @@ function normOptions(W){
     right:rightNormalize(o?.right),
   })).filter(o=>o.underlying && o.right && Number.isFinite(o.strike));
 }
-// function getWatchlist(){ return { equities: normEquities(WATCH), options: normOptions(WATCH) }; }
-// async function watchAddEquities(eqs=[]){
-//   const before = normEquities(WATCH).length;
-//   for (const s of eqs) { const u=String(s).toUpperCase(); if (u) WATCH.equities.add(u); }
-//   const after = normEquities(WATCH).length;
-//   if (after>before) wsBroadcast("watchlist", getWatchlist());
-//   return Math.max(0, after-before);
-// }
-// async function watchAddEquities(eqs=[]){
-//   const before = normEquities(WATCH).length;
-//   for (const s of eqs) { const u = canon(s); if (u) WATCH.equities.add(u); }
-//   const after = normEquities(WATCH).length;
-//   if (after>before) wsBroadcast("watchlist", getWatchlist());
-//   return Math.max(0, after-before);
-// }
-// async function watchAddEquities(symbols=[]) {
-//   for (const raw of symbols) {
-//     const sym = normalizeSymbol(raw);
-//     WATCH.equities.add(sym);          // keep "ES" (not "/ES"), keep "SPX"
-//   }
-//   wsBroadcast("watchlist", getWatchlist());
-//   return Array.from(WATCH.equities);
-// }
-async function watchAddEquities(symbols = []) {
-  for (const raw of symbols) {
-    const sym = normalizeSymbol(raw);   // "/ES" -> "ES"
-    WATCH.equities.add(sym);
-    if (sym === "ES") {
-      FUT_FRONT.delete("ES");
-      CACHE.conidBySym.delete("ES");
-      await resolveFrontMonthES().catch(()=>{});
-    }
-  }
-  // wsBroadcast("watchlist", getWatchlist());
-  wsBroadcast("watchlist", makeWatchlistPayload());
-  return Array.from(WATCH.equities);
-}
 function fixEsSpxCollision(pairs){
   const es = pairs.find(p => p.sym === "ES");
   const spx = pairs.find(p => p.sym === "SPX");
@@ -1770,63 +1735,6 @@ function fixEsSpxCollision(pairs){
     FUT_FRONT.delete("ES");
   }
 }
-// async function ibConidForSymbol(sym){
-//   if (!isNonEmptyStr(sym)) return null;
-//   const key = canon(sym);
-
-//   // cache hit?
-//   const cached = CACHE.conidBySym.get(key);
-//   if (cached && cached.ts && (Date.now()-cached.ts) < CONID_TTL_MS) return cached.conid;
-
-//   // MOCK mode quick map
-//   if (MOCK){
-//     const demo = { AAPL:"265598", NVDA:"4815747", MSFT:"272093", SPY:"756733", SPX:"416904", ES:"123456" };
-//     const c = demo[key] || String(100000+Math.floor(Math.random()*9e5));
-//     CACHE.conidBySym.set(key, { conid:c, ts:Date.now() });
-//     return c;
-//   }
-
-//   // search once
-//   let best = null;
-//   try {
-//     const body = await ibFetch(`/iserver/secdef/search?symbol=${encodeURIComponent(key)}`);
-//     const list = Array.isArray(body) ? body : (body ? [body] : []);
-
-//     // prefer STK, then IND, then FUT
-//     const pick = (secType) =>
-//       list.find(r => String(r?.symbol||"").toUpperCase()===key &&
-//                      (r?.sections||[]).some(s=>s?.secType===secType) && r?.conid);
-
-//     best = pick("STK") || pick("IND") || pick("FUT") || list.find(r => r?.conid);
-//   } catch {}
-
-//   // FUT (ES): choose a front contract if choices exist
-//   if (best && (best.sections||[]).some(s=>s.secType==="FUT")) {
-//     // some responses include Contracts array; pick nearest expiry
-//     try {
-//       const info = await ibFetch(`/iserver/secdef/info?conid=${best.conid}`);
-//       const contracts = info?.Contracts || info || [];
-//       if (Array.isArray(contracts) && contracts.length) {
-//         const now = Date.now();
-//         contracts.sort((a,b)=>{
-//           const ta = Date.parse(a?.expiry || a?.maturity || "2100-01-01");
-//           const tb = Date.parse(b?.expiry || b?.maturity || "2100-01-01");
-//           return Math.abs(ta-now) - Math.abs(tb-now);
-//         });
-//         const fut = contracts.find(c=>c?.conid) || contracts[0];
-//         if (fut?.conid) best = { ...best, conid: String(fut.conid) };
-//       }
-//     } catch {}
-//   }
-
-//   const conid = best?.conid ? String(best.conid) : null;
-//   if (conid) CACHE.conidBySym.set(key, { conid, ts:Date.now() });
-//   return conid;
-// }
-// --- helpers & config (place near your other consts) ---
-// const CONID_TTL_MS = 24 * 60 * 60 * 1000;
-// const FUT_ALIASES = new Map([["/ES","ES"]]);
-
 function isNonEmptyStr(s){ return typeof s === "string" && s.trim().length > 0; }
 function canon(s){ return (FUT_ALIASES.get(String(s).trim().toUpperCase()) || String(s).trim().toUpperCase()); }
 
@@ -1898,14 +1806,6 @@ async function ibConidForSymbol(sym){
   const cached = CACHE.conidBySym.get(key);
   if (cached?.conid && (Date.now() - (cached.ts || 0)) < CONID_TTL_MS) return cached.conid;
 
-  // MOCK mode
-  // if (MOCK){
-  //   const demo = { AAPL:"265598", NVDA:"4815747", MSFT:"272093", SPY:"756733", SPX:"416904", ES:"123456" };
-  //   const c = demo[key] || String(100000 + Math.floor(Math.random()*9e5));
-  //   CACHE.conidBySym.set(key, { conid:c, ts:Date.now() });
-  //   return c;
-  // }
-
   // Query IB
   let best = null;
   try{
@@ -1922,22 +1822,6 @@ async function ibConidForSymbol(sym){
   const conid = best?.conid ? String(best.conid) : null;
   if (conid) CACHE.conidBySym.set(key, { conid, ts: Date.now() });
   return conid;
-}
-async function watchAddOptions(options=[]){
-  if (!Array.isArray(WATCH.options)) WATCH.options=[];
-  const before = normOptions(WATCH).length;
-  for (const raw of options){
-    const o = {
-      underlying:String(raw?.underlying||"").toUpperCase(),
-      expiration:String(raw?.expiration||""),
-      strike:Number(raw?.strike),
-      right:rightNormalize(raw?.right),
-    };
-    if (o.underlying && o.right && Number.isFinite(o.strike)) WATCH.options.push(o);
-  }
-  const after = normOptions(WATCH).length;
-  if (after>before) wsBroadcast("watchlist", makeWatchlistPayload());//wsBroadcast("watchlist", getWatchlist());
-  return Math.max(0, after-before);
 }
 
 /* ================= MONTH PARSING (3rd Friday) ================= */
@@ -2097,51 +1981,6 @@ async function ibOptMonthsForSymbol(sym){
   return exps;
 }
 
-// async function ibOptMonthsForSymbol(sym){
-//   const key = sym.toUpperCase();
-//   const hit = CACHE.expBySym.get(key);
-//   if (hit && (Date.now()-hit.ts) < EXP_TTL_MS) return hit.expirations;
-
-//   if (MOCK){
-//     const exps = [
-//       "2025-11-21", "2025-12-21", "2026-01-16", "2026-02-20"
-//     ];
-//     CACHE.expBySym.set(key, { ts:Date.now(), expirations:exps });
-//     return exps;
-//   }
-
-//   const body = await ibFetch(`/iserver/secdef/search?symbol=${encodeURIComponent(key)}`);
-//   const list = Array.isArray(body) ? body : (body ? [body] : []);
-//   const rec  = list.find(x => String(x?.symbol||"").toUpperCase()===key) || list[0];
-//   const optSec = (rec?.sections||[]).find(s => s?.secType==="OPT");
-//   const tokens = optSec?.months || "";
-//   const exps = monthsTokensToThirdFridays(tokens);
-//   CACHE.expBySym.set(key, { ts:Date.now(), expirations:exps });
-//   return exps;
-// }
-
-/* ================= MAPPERS ================= */
-// function mapEquitySnapshot(sym, s){
-//   return { symbol:sym, last:num(s["31"]), bid:num(s["84"]), ask:num(s["86"]), iv:num(s["7059"]), ts:Date.now() };
-// }
-// function mapEquitySnapshot(sym, s){
-//   const last = s['31'] ?? null;
-//   const bid  = s['84'] ?? null;
-//   const ask  = s['86'] ?? null;
-//   const iv   = s['7059'] ?? null; // can be null for SPX
-//   return { symbol: sym, last, bid, ask, iv, ts: Date.now() };
-// }
-
-// function mapOptionTick(ul, expiration, strike, right, s0){
-//   return { underlying:ul, expiration, strike, right, last:num(s0["31"]), bid:num(s0["84"]), ask:num(s0["86"]), ts:Date.now() };
-// }
-
-// Real-time last price cache: lastBySymbol["SPY"] = 504.23, etc.
-const lastBySymbol = Object.create(null);
-const getLast = (sym) => {
-  const v = lastBySymbol[sym?.toUpperCase()?.replace(/^\//, "")];
-  return Number.isFinite(v) ? v : null;
-};
 
 
 function mapEquitySnapshot(sym, s) {
@@ -2159,18 +1998,6 @@ function mapEquitySnapshot(sym, s) {
   };
 }
 
-// function mapOptionTick(ul, expiration, strike, right, s0) {
-//   return {
-//     underlying: ul,
-//     expiration,
-//     strike: Number(strike),
-//     right,
-//     last: toNumStrict(s0["31"]),
-//     bid:  toNumStrict(s0["84"]),
-//     ask:  toNumStrict(s0["86"]),
-//     ts: Date.now()
-//   };
-// }
  function mapOptionTick(ul, expiration, strike, right, s0) {
    return {
      underlying: ul,
@@ -2212,19 +2039,6 @@ async function resolveFrontMonthES(){
   return null;
 }
 
-// Memoizing conid fetch for equities/indices (24h TTL)
-// async function ensureConid(symbol){
-//   const key = (symbol || "").toUpperCase();
-//   const cached = CACHE.conidBySym.get(key);
-//   if (cached?.conid && Date.now() - (cached.ts || 0) < 24 * 60 * 60 * 1000) {
-//     return cached.conid;
-//   }
-//   const conid = await ibConidForSymbol(key).catch(()=>null);
-//   if (conid){
-//     CACHE.conidBySym.set(key, { conid: String(conid), ts: Date.now() });
-//   }
-//   return conid;
-// }
 async function ensureConid(symbol){
   const key = (symbol || "").toUpperCase();
 
@@ -2244,199 +2058,6 @@ async function ensureConid(symbol){
   }
   return conid;
 }
-// async function ensureConid(symbol){
-//   const key = (symbol || "").toUpperCase();
-
-//   // SPECIAL: ES uses front-month resolver
-//   if (key === "ES") {
-//     const r = await resolveFrontMonthES().catch(()=>null);
-//     return r?.conid || null;
-//   }
-
-//   // memoized for everything else
-//   const cached = CACHE.conidBySym.get(key);
-//   if (cached?.conid && Date.now() - (cached.ts || 0) < 24 * 60 * 60 * 1000) {
-//     return cached.conid;
-//   }
-//   const conid = await ibConidForSymbol(key).catch(()=>null);
-//   if (conid){
-//     CACHE.conidBySym.set(key, { conid: String(conid), ts: Date.now() });
-//   }
-//   return conid;
-// }
-
-// async function ensureConid(symbol){
-//   const key = (symbol || "").toUpperCase();
-//   if (key === "ES") {
-//     const r = await resolveFrontMonthES();
-//     return r?.conid || null;
-//   }
-//   const cached = CACHE.conidBySym.get(key);
-//   if (cached?.conid && Date.now() - (cached.ts || 0) < 24*60*60*1000) return cached.conid;
-//   const conid = await ibConidForSymbol(key).catch(()=>null);
-//   if (conid) CACHE.conidBySym.set(key, { conid: String(conid), ts: Date.now() });
-//   return conid;
-// }
-
-// function normalizeSymbol(s) {
-//   const up = String(s || "").trim().toUpperCase();
-//   return FUT_ALIASES.get(up) || up;   // "/ES" -> "ES"
-// }
-// ===== CONID resolution for indices & futures =====
-// const FUT_FRONT = new Map(); // ES -> { conid, ts }
-
-// function symbolToConid(symbol){
-//   const s = (symbol||"").toUpperCase();
-//   if (s === "ES") {
-//     const r = FUT_FRONT.get("ES");
-//     if (r?.conid) return r.conid; // front month
-//   }
-//   return CACHE.conidBySym.get(s)?.conid || null;
-// }
-
-// async function resolveFrontMonthES(){
-//   const cur = FUT_FRONT.get("ES");
-//   if (cur && Date.now() - (cur.ts||0) < 10*60*1000) return cur; // 10 min TTL
-
-//   // Your existing IB symbol lookup; try both variants
-//   const conid =
-//     await ibConidForSymbol("ES").catch(()=>null) ||
-//     await ibConidForSymbol("/ES").catch(()=>null);
-//   if (conid){
-//     const rec = { conid:String(conid), ts:Date.now() };
-//     FUT_FRONT.set("ES", rec);
-//     return rec;
-//   }
-//   return null;
-// }
-
-// async function ensureConid(symbol){
-//   const key = (symbol||"").toUpperCase();
-//   // ES handled by resolveFrontMonthES
-//   if (key === "ES") {
-//     const r = await resolveFrontMonthES();
-//     return r?.conid || null;
-//   }
-//   const cached = CACHE.conidBySym.get(key);
-//   if (cached?.conid && Date.now() - (cached.ts||0) < 24*60*60*1000) return cached.conid;
-
-//   const conid = await ibConidForSymbol(key).catch(()=>null);
-//   if (conid) CACHE.conidBySym.set(key, { conid:String(conid), ts:Date.now() });
-//   return conid;
-// }
-
-// async function pollEquitiesOnce(){
-//   try {
-//     const symbols = (normEquities?.(WATCH) || []).map(s => (s || "").toUpperCase());
-//     if (!symbols.length) return;
-
-//     // 1) Make sure ES front-month is resolved once before polling, if we need it
-//     if (symbols.some(s => s === "/ES" || s === "ES")) {
-//       const esConid = symbolToConid("ES");
-//       if (!esConid) await resolveFrontMonthES().catch(()=>{});
-//     }
-
-//     // 2) Build symbol↔conid pairs using symbolToConid, falling back to ensureConid()
-//     const pairs = [];
-//     for (const sym of symbols){
-//       let conid = symbolToConid(sym);
-//       if (!conid) {
-//         // equities/indices: try normal resolver
-//         if (sym !== "/ES" && sym !== "ES") {
-//           conid = await ensureConid(sym).catch(()=>null);
-//         } else {
-//           // futures: re-resolve front month if needed
-//           await resolveFrontMonthES().catch(()=>{});
-//           conid = symbolToConid(sym);
-//         }
-//       }
-//       if (conid) pairs.push({ sym: sym === "/ES" ? "ES" : sym, conid: String(conid) });
-//     }
-//     if (!pairs.length) {
-//       // Push placeholders so UI shows the symbols even if unresolved this tick
-//       const placeholders = symbols.map(sym => ({ symbol: sym, last: null, ts: Date.now() }));
-//       STATE.equities_ts = placeholders;
-//       wsBroadcast("equity_ts", placeholders);
-//       return;
-//     }
-
-//     // 3) Fetch snapshots (or mock)
-//     let rows = [];
-//     if (MOCK) {
-//       // simple mock: give something stable-ish per symbol
-//       for (const p of pairs) {
-//         const base = { SPY: 679, QQQ: 627, IWM: 244, AAPL: 267, NVDA: 205, MSFT: 514, SPX: 5600, ES: 5600 };
-//         const last = (base[p.sym] ?? 100) + Math.random()*0.5 - 0.25;
-//         rows.push({ symbol: p.sym, last: Number(last.toFixed(2)), bid: last-0.1, ask: last+0.1, iv: 40, ts: Date.now() });
-//       }
-//     } else {
-//       const conids = pairs.map(p => p.conid).join(",");
-//       // fields: 31=last, 84=bid, 86=ask, 7059=iv (or whatever your mapper expects)
-//       const snaps = await ibFetch(`/iserver/marketdata/snapshot?conids=${encodeURIComponent(conids)}&fields=31,84,86,7059`);
-//       for (const p of pairs) {
-//         const s = Array.isArray(snaps) ? snaps.find(z => String(z.conid) === String(p.conid)) : null;
-//         if (!s) {
-//           rows.push({ symbol: p.sym, last: null, ts: Date.now() });
-//           continue;
-//         }
-//         rows.push(mapEquitySnapshot(p.sym, s));
-//       }
-//     }
-
-//     // 4) Preserve order as `symbols`, and ensure any missing symbols get placeholders
-//     const bySym = new Map(rows.map(r => [r.symbol, r]));
-//     const ordered = symbols.map(sym => bySym.get(sym === "/ES" ? "ES" : sym) || { symbol: sym, last: null, ts: Date.now() });
-
-//     STATE.equities_ts = ordered;
-//     wsBroadcast("equity_ts", ordered);
-//   } catch (e) {
-//     console.warn("pollEquitiesOnce:", e?.message || e);
-//   }
-// }
-// async function pollEquitiesOnce(){
-//   try{
-//     // 1) normalize current watchlist
-//     const symbols = Array.from(WATCH.equities || []).map(normalizeSymbol);
-//     if (!symbols.length) return;
-
-//     // 2) get conids (memoized) — ES via resolveFrontMonth
-//     const pairs = [];
-//     for (const sym of symbols){
-//       try{
-//         const conid = await ensureConid(sym);
-//         if (conid) pairs.push({ sym, conid });
-//       }catch{}
-//     }
-//     if (!pairs.length) return;
-
-//     // 3) fetch IB snapshot
-//     let rows=[];
-//     if (MOCK){
-//       rows = pairs.map(p => ({
-//         symbol: p.sym,
-//         last: 100 + Math.random()*50,
-//         bid: 0, ask: 0, iv: p.sym==="MSFT" ? 0.40 : 1.00,
-//         ts: Date.now()
-//       }));
-//     }else{
-//       const conids = pairs.map(p=>p.conid).join(",");
-//       // 31: last, 84: bid, 86: ask, 7059: implied vol (may be missing for index)
-//       const snaps  = await ibFetch(`/iserver/marketdata/snapshot?conids=${encodeURIComponent(conids)}&fields=31,84,86,7059`);
-//       for (const p of pairs){
-//         const s = Array.isArray(snaps) ? snaps.find(z => String(z.conid)===String(p.conid)) : null;
-//         if (!s) continue;
-//         rows.push(mapEquitySnapshot(p.sym, s)); // keep your existing mapper
-//       }
-//     }
-
-//     if (rows.length){
-//       STATE.equities_ts = rows;
-//       wsBroadcast("equity_ts", rows);
-//     }
-//   }catch(e){
-//     console.warn("pollEquitiesOnce:", e.message);
-//   }
-// }
 // helper: prefer last; else mid; else NaN
 function midOrLast(t) {
   const last = Number(t?.last);
@@ -2447,13 +2068,6 @@ function midOrLast(t) {
   }
   return NaN;
 }
-// function midOrLast(row) {
-//   const last = Number(row?.last);
-//   if (Number.isFinite(last) && last !== 0) return last;
-//   const bid = Number(row?.bid), ask = Number(row?.ask);
-//   if (Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 && ask > 0) return (bid + ask) / 2;
-//   return NaN;
-// }
 
 function fresh(row, ms=60_000) { return row?.ts && (Date.now() - row.ts) < ms; }
 function safeMapEquity(sym, snap) {
@@ -2468,116 +2082,167 @@ function safeMapEquity(sym, snap) {
   }
   return r;
 }
-async function pollEquitiesOnce(){
-  try{
+async function pollEquitiesOnce() {
+  try {
+    // 1) Normalize requested symbols up front
     const symbols = Array.from(WATCH.equities || []).map(normalizeSymbol);
     if (!symbols.length) return;
 
+    // 2) Resolve conids for each (normalize BEFORE ensureConid)
     const pairs = [];
-    for (const sym of symbols){
+    for (const sym of symbols) {
       try {
-        const conid = await ensureConid(sym); // ES should resolve to front-month
-        if (conid) pairs.push({ sym, conid });
+        const conid = await ensureConid(sym); // ES (or /ES) => front-month
+        if (conid) pairs.push({ sym: normalizeSymbol(sym), conid });
       } catch {}
     }
     if (!pairs.length) return;
 
+    // (optional) any dedupe/collision logic you want
+    fixEsSpxCollision(pairs);
+
+    // 3) Build rows (always normalized)
     let rows = [];
-    if (MOCK){
+    if (MOCK) {
       rows = pairs.map(p => ({
-        symbol: p.sym,
-        last: 100 + Math.random()*50,
-        bid: 0, ask: 0, iv: p.sym==="MSFT" ? 0.40 : 1.00,
+        symbol: normalizeSymbol(p.sym),
+        last: 100 + Math.random() * 50,
+        bid: 0, ask: 0,
+        iv: p.sym === "MSFT" ? 0.40 : 1.00,
         ts: Date.now()
       }));
-    }else{
-      const conids = pairs.map(p=>p.conid).join(",");
+    } else {
+      const conids = pairs.map(p => p.conid).join(",");
       // 31: last, 84: bid, 86: ask, 7059: IV
-      const snaps = await ibFetch(`/iserver/marketdata/snapshot?conids=${encodeURIComponent(conids)}&fields=31,84,86,7059`);
-      for (const p of pairs){
-        const s = Array.isArray(snaps) ? snaps.find(z => String(z.conid)===String(p.conid)) : null;
+      const snaps = await ibFetch(
+        `/iserver/marketdata/snapshot?conids=${encodeURIComponent(conids)}&fields=31,84,86,7059`
+      );
+      for (const p of pairs) {
+        const s = Array.isArray(snaps) ? snaps.find(z => String(z.conid) === String(p.conid)) : null;
         if (!s) continue;
-        // rows.push(mapEquitySnapshot(p.sym, s));
-        rows.push(safeMapEquity(p.sym, s));
+        // Force canonical symbol on the mapped row
+        const r = safeMapEquity(normalizeSymbol(p.sym), s);
+        rows.push(r);
       }
     }
-    // ----- compute ES–SPX basis (points) -----
+
+    // 4) Compute ES–SPX basis using canonical keys
     let es_spx_basis = null;
     const bySym = new Map(rows.map(r => [normalizeSymbol(r.symbol), r]));
-    const es = bySym.get("ES");
-    const spx = bySym.get("SPX");
+    const ES_KEY  = normalizeSymbol("ES");   // e.g., "/ES" if you canonicalize with slash
+    const SPX_KEY = normalizeSymbol("SPX");  // stays "SPX"
+
+    const es  = bySym.get(ES_KEY);
+    const spx = bySym.get(SPX_KEY);
+
     if (es && spx && fresh(es) && fresh(spx)) {
       const esPx  = midOrLast(es);
       const spxPx = midOrLast(spx);
       if (Number.isFinite(esPx) && Number.isFinite(spxPx)) {
         es_spx_basis = Number((esPx - spxPx).toFixed(2));
       }
-      
-      for (const r of rows) if (Number.isFinite(r?.last)) await onTick(r.symbol, r.last);
-      // broadcast the richer payload your UI expects
-      // in pollEquitiesOnce(), right after you build `rows`
-      for (const r of rows) {
-        if (Number.isFinite(r?.last)) {
-          updateUnderlyingLast(r.symbol, r.last, r.ts ?? Date.now()); // <— NEW
-        }
-      }      
-      STATE.equities_ts = rows;
-      // wsBroadcast("equity_ts", { rows, es_spx_basis });
-      wsBroadcast("equity_ts", rows);
-      if (es_spx_basis != null) wsBroadcast("basis", { es_spx_basis });      
     }
-  }catch(e){
-    console.warn("pollEquitiesOnce:", e.message);
+
+    // 5) Update tick caches regardless of basis
+    for (const r of rows) if (Number.isFinite(r?.last)) await onTick(r.symbol, r.last);
+    for (const r of rows) if (Number.isFinite(r?.last)) updateUnderlyingLast(r.symbol, r.last, r.ts ?? Date.now());
+
+    // 6) Persist & broadcast (rows already canonical)
+    rows = rows.map(r => ({ ...r, symbol: normalizeSymbol(r.symbol) }));
+    STATE.equities_ts = rows;
+    assertCanonicalRows("equity_ts", rows); // temp debug logger
+    wsBroadcast("equity_ts", rows);
+    if (es_spx_basis != null) wsBroadcast("basis", { es_spx_basis });
+  } catch (e) {
+    console.warn("pollEquitiesOnce:", e?.message ?? e);
   }
 }
-// app.get('/insights/notables', (req, res) => {
-//   try {
-//     const cfg = Object.fromEntries(Object.entries(req.query).map(([k,v])=>[k, Number(v)]));
-//     // const payload = buildNotables({ sweeps: memory.sweeps||[], blocks: memory.blocks||[] }, cfg);
-//     const payload = buildNotables({ sweeps: STATE.sweeps || [], blocks: STATE.blocks || [] }, cfg);
-//     res.json(payload);
-//   } catch (e) { res.status(500).json({ error: e?.message||'fail' }); }
-// });
+// async function pollEquitiesOnce(){
+//   try{
+//     const symbols = Array.from(WATCH.equities || []).map(normalizeSymbol);
+//     if (!symbols.length) return;
 
+//     const pairs = [];
+//     for (const sym of symbols){
+//       try {
+//         const conid = await ensureConid(sym); // ES should resolve to front-month
+//         if (conid) pairs.push({ sym, conid });
+//       } catch {}
+//     }
+//     if (!pairs.length) return;
+//     fixEsSpxCollision(pairs);
+//     let rows = [];
+//     if (MOCK){
+//       rows = pairs.map(p => ({
+//         symbol: p.sym,
+//         last: 100 + Math.random()*50,
+//         bid: 0, ask: 0, iv: p.sym==="MSFT" ? 0.40 : 1.00,
+//         ts: Date.now()
+//       }));
+//     }else{
+//       const conids = pairs.map(p=>p.conid).join(",");
+//       // 31: last, 84: bid, 86: ask, 7059: IV
+//       const snaps = await ibFetch(`/iserver/marketdata/snapshot?conids=${encodeURIComponent(conids)}&fields=31,84,86,7059`);
+//       for (const p of pairs){
+//         const s = Array.isArray(snaps) ? snaps.find(z => String(z.conid)===String(p.conid)) : null;
+//         if (!s) continue;
+//         // rows.push(mapEquitySnapshot(p.sym, s));
+//         rows.push(safeMapEquity(p.sym, s));
+//       }
+//     }
+//     // ----- compute ES–SPX basis (points) -----
+//     let es_spx_basis = null;
+//     const bySym = new Map(rows.map(r => [normalizeSymbol(r.symbol), r]));
+//     const es = bySym.get("ES");
+//     const spx = bySym.get("SPX");
+//     // if (es && spx && fresh(es) && fresh(spx)) {
+//     //   const esPx  = midOrLast(es);
+//     //   const spxPx = midOrLast(spx);
+//     //   if (Number.isFinite(esPx) && Number.isFinite(spxPx)) {
+//     //     es_spx_basis = Number((esPx - spxPx).toFixed(2));
+//     //   }
+      
+//     //   for (const r of rows) if (Number.isFinite(r?.last)) await onTick(r.symbol, r.last);
+//     //   // broadcast the richer payload your UI expects
+//     //   // in pollEquitiesOnce(), right after you build `rows`
+//     //   for (const r of rows) {
+//     //     if (Number.isFinite(r?.last)) {
+//     //       updateUnderlyingLast(r.symbol, r.last, r.ts ?? Date.now()); // <— NEW
+//     //     }
+//     //   }      
+//     //   STATE.equities_ts = rows;
+//     //   // wsBroadcast("equity_ts", { rows, es_spx_basis });
+//     //   wsBroadcast("equity_ts", rows);
+//     //   if (es_spx_basis != null) wsBroadcast("basis", { es_spx_basis });      
+//     // }
+//    if (es && spx && fresh(es) && fresh(spx)) {
+//      const esPx  = midOrLast(es);
+//      const spxPx = midOrLast(spx);
+//      if (Number.isFinite(esPx) && Number.isFinite(spxPx)) {
+//        es_spx_basis = Number((esPx - spxPx).toFixed(2));
+//      }
+//    }
+//    // Always keep last prices + broadcast quotes, independent of SPX presence
+//    for (const r of rows) if (Number.isFinite(r?.last)) await onTick(r.symbol, r.last);
+//    for (const r of rows) if (Number.isFinite(r?.last)) updateUnderlyingLast(r.symbol, r.last, r.ts ?? Date.now());
+//    STATE.equities_ts = rows;
 
-
-// const NOTABLES_DEFAULT = { 
-//   windowMs: 5*60_000, 
-//   minNotional: 75_000, 
-//   topN: 50, 
-//   side: "ANY", 
-//   expiryMaxDays: 365 
-// };
-
-
-// function withMark(row){
-//   const occ = toOcc(row.ul, row.expiry, rightToCP(row.right), row.strike);
-//   const q = NBBO_OPT.get(occ);
-//   const mark = (q && q.bid>0 && q.ask>0) ? (q.bid+q.ask)/2 : undefined;
-//   return { ...row, mark };
-// }
-
-// Safer helpers in case right is already "C"/"P" or "CALL"/"PUT"
-const rightToCPSafe = (r) =>
-  r === "C" || r === "P" ? r : (r === "CALL" ? "C" : (r === "PUT" ? "P" : r));
-// function withMark(row) {
-//   try {
-//     const occ = toOcc(row.ul, row.expiry, rightToCPSafe(row.right), row.strike);
-//     const q = NBBO_OPT.get(occ);
-//     const bid = q?.bid, ask = q?.ask;
-//     const mark = (Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 && ask > 0)
-//       ? (bid + ask) / 2
-//       : undefined; // keep undefined unless we have a proper NBBO
-//     return { ...row, bid, ask, mark };
-//   } catch {
-//     // If anything is off (e.g., missing fields), just return row unchanged
-//     return row;
+//   //  const data = ticks.map(t => ({ ...t, symbol: normalizeSymbol(t.symbol) }));
+//    assertCanonicalRows('equity_ts', rows)
+//    wsBroadcast("equity_ts", rows);
+//    if (es_spx_basis != null) wsBroadcast("basis", { es_spx_basis });    
+//   }catch(e){
+//     console.warn("pollEquitiesOnce:", e.message);
 //   }
 // }
+
+const rightToCPSafe = (r) =>
+  r === "C" || r === "P" ? r : (r === "CALL" ? "C" : (r === "PUT" ? "P" : r));
 function withMark(row){
   try {
-    const occ  = toOcc(row.ul, row.expiry, rightToCP(row.right), row.strike);
-    const q    = NBBO_OPT.get?.(occ);
+    // const occ  = toOcc(row.ul, row.expiry, rightToCP(row.right), row.strike);
+    const k = optKey(row.ul, row.expiry, row.right, row.strike);
+    const q    = NBBO_OPT.get?.(k);
     const bid  = q?.bid, ask = q?.ask;
 
     // Prefer explicit mid if you store it
@@ -2628,6 +2293,18 @@ app.get("/api/flow/sweeps", (req,res)=>{
 
   res.json({ rows, ts: Date.now() });
 });
+app.post('/api/flow/headlines/publish', (req, res) => {
+  const out = [];
+  for (const r of req.body.rows ?? []) {
+    const row = { ...r, ul: normalizeSymbol(r.ul) };
+    // (optional) row.asset_class ??= guessFromUL(row.ul);
+    store.headlines.push(row);
+    out.push(row);
+  }
+  // broadcast by canonical UL
+  for (const row of out) broadcast('headlines', [row]); // send array or your shape
+  res.json({ ok: true, count: out.length, dropped: 0, reasons: {} });
+});
 app.post("/api/flow/prints/publish", (req,res)=>{
   const rows = (req.body?.rows ?? [])
     .filter(passesPublishGate)
@@ -2637,59 +2314,6 @@ app.post("/api/flow/prints/publish", (req,res)=>{
   publishPrints(rows);
   res.json({ ok:true, count: rows.length });
 });
-// app.get("/api/flow/blocks", (req,res)=>{
-//   const minNotional = Number(req.query.minNotional ?? 50_000);
-//   const limit = Number(req.query.limit ?? 50);
-//   const rows = computeBlocks(9999, minNotional)
-//     .filter(passesPublishGate)                                  // 🔒 NEW
-//     .slice(0, limit)
-//     // .map(r => ({ ...r, ul_px: (getUnderlyingLastNear(r.ul, r.ts) ?? getLast(r.ul) ?? null) }));
-//    .map(r => ({ ...r, ul_px: (getUnderlyingLastNear(r.ul, r.ts) ?? getLast(r.ul) ?? null) }))
-//    .map(withMark);    
-//   publishBlocks(rows);
-//   res.json({ rows, ts: Date.now() });
-// });
-// app.get("/api/flow/sweeps", (req,res)=>{
-//   const minNotional = Number(req.query.minNotional ?? 25_000);
-//   const limit = Number(req.query.limit ?? 200);
-//   const base = computeSweeps(9999, minNotional)
-//     .filter(passesPublishGate)                                  // 🔒 NEW
-//     .slice(0, limit);
-//   // const rows = base.map(r => attachDayStats({
-//   //   ...r,
-//   //   ul_px: (getUnderlyingLastNear(r.ul, r.ts) ?? getLast(r.ul) ?? null)
-//   // }));
-//  const rows = base
-//    .map(r => attachDayStats({
-//      ...r,
-//      ul_px: (getUnderlyingLastNear(r.ul, r.ts) ?? getLast(r.ul) ?? null)
-//    }))
-//    .map(withMark);  
-//   publishSweeps(rows); 
-//   res.json({ rows, ts: Date.now() });
-// });
-
-// app.get("/api/flow/blocks", (req,res)=>{
-//   const minNotional = Number(req.query.minNotional ?? 50_000);
-//   const limit = Number(req.query.limit ?? 50);
-//   const rows = computeBlocks(9999, minNotional).slice(0, limit).map(r => ({
-//     ...r,
-//     ul_px: (getUnderlyingLastNear(r.ul, r.ts) ?? getLast(r.ul) ?? null)
-//   }));
-//   res.json({ rows, ts: Date.now() });
-// });
-
-// app.get("/api/flow/sweeps", (req,res)=>{
-//   const minNotional = Number(req.query.minNotional ?? 25_000);
-//   const limit = Number(req.query.limit ?? 200);
-//   const base = computeSweeps(9999, minNotional).slice(0, limit);
-//   const rows = base.map(r => attachDayStats({
-//     ...r,
-//     ul_px: (getUnderlyingLastNear(r.ul, r.ts) ?? getLast(r.ul) ?? null)
-//   }));
-//   res.json({ rows, ts: Date.now() });
-// });
-
 app.get("/debug/snapshot_raw", async (req,res)=>{
   try {
     const conids = String(req.query.conids||"").trim();
@@ -2699,105 +2323,6 @@ app.get("/debug/snapshot_raw", async (req,res)=>{
   } catch(e){ res.status(500).json({ error:e.message }); }
 });
 
-// async function pollEquitiesOnce(){
-//   try{
-//     // 1) normalize & de-dup watchlist ("/ES" -> "ES")
-//     const symbols = Array.from(new Set(Array.from(WATCH.equities || []).map(normalizeSymbol)));
-//     if (!symbols.length) return;
-
-//     // 2) resolve conids (ES via front-month resolver in ensureConid)
-//     let pairs = [];
-//     for (const sym of symbols){
-//       try{
-//         const conid = await ensureConid(sym);
-//         if (conid) pairs.push({ sym: sym.toUpperCase(), conid: String(conid) });
-//       } catch {}
-//     }
-//     if (!pairs.length) return;
-
-//     // 2a) guard against ES/SPX conid collisions (ES accidentally resolved as SPX index)
-//     const es = pairs.find(p => p.sym === "ES");
-//     const spx = pairs.find(p => p.sym === "SPX");
-//     if (es && spx && es.conid === spx.conid){
-//       // nuke ES caches so front-month resolver runs cleanly
-//       try { FUT_FRONT?.delete?.("ES"); } catch {}
-//       try { CACHE?.conidBySym?.delete?.("ES"); } catch {}
-//       // re-resolve ES once
-//       try {
-//         const fixed = await ensureConid("ES");
-//         if (fixed && String(fixed) !== spx.conid){
-//           // replace the bad ES pair
-//           pairs = pairs.map(p => p.sym === "ES" ? ({ sym: "ES", conid: String(fixed) }) : p);
-//         } else {
-//           // if still colliding, drop ES for this tick; it will fix on next loop
-//           pairs = pairs.filter(p => p.sym !== "ES");
-//         }
-//       } catch {
-//         pairs = pairs.filter(p => p.sym !== "ES");
-//       }
-//     }
-
-//     if (!pairs.length) return;
-
-//     // 3) fetch snapshots
-//     let rows = [];
-//     if (MOCK){
-//       const now = Date.now();
-//       rows = pairs.map(p => ({
-//         symbol: p.sym,
-//         last: 100 + Math.random()*50 + (p.sym === "ES" ? 0.37 : 0), // make ES visibly different in mock
-//         bid: null, ask: null,
-//         iv: p.sym==="MSFT" ? 0.40 : null,
-//         ts: now
-//       }));
-//     } else {
-//       const conids = pairs.map(p=>p.conid).join(",");
-//       const snaps  = await ibFetch(`/iserver/marketdata/snapshot?conids=${encodeURIComponent(conids)}&fields=31,84,86,7059`);
-//       const arr = Array.isArray(snaps) ? snaps : (snaps?.data ?? []); // be tolerant
-
-//       // Build a fast lookup by conid
-//       const byConid = new Map();
-//       for (const s of arr) {
-//         if (s && (s.conid || s.conid === 0)) byConid.set(String(s.conid), s);
-//       }
-
-//       // wrapper around your existing mapper with optional synthetic spread
-//       function safeMap(sym, snap){
-//         const r = mapEquitySnapshot(sym, snap); // uses 31/84/86/7059
-//         if (r && r.last != null && (r.bid == null || r.ask == null)) {
-//           // synthesize a tiny spread so UI isn't empty when IB omits bid/ask (indexes/futures)
-//           const px = Number(r.last);
-//           if (!Number.isNaN(px)) {
-//             r.bid ??= Number((px * 0.999).toFixed(2));
-//             r.ask ??= Number((px * 1.001).toFixed(2));
-//           }
-//         }
-//         return r;
-//       }
-
-//       for (const p of pairs){
-//         const s = byConid.get(p.conid);
-//         if (!s) continue;
-//         const row = safeMap(p.sym, s);
-//         if (row) rows.push(row);
-//       }
-//     }
-
-//     // 4) publish
-//     // if (rows.length){
-//     //   STATE.equities_ts = rows;
-//     //   wsBroadcast("equity_ts", rows);
-//     // }
-//     if (rows.length){
-//       const enriched = rows.map(enrichRow);
-//       const basis = computeBasis(enriched); // e.g., +2.15 means ES > SPX by 2.15 pts
-//       STATE.equities_ts = enriched;
-//       wsBroadcast("equity_ts", { rows: enriched, es_spx_basis: basis });
-//     }    
-//   }catch(e){
-//     console.warn("pollEquitiesOnce:", e?.message || e);
-//   }
-// }
 function enrichRow(r){
   const kind = (r.symbol === "ES") ? "future" :
                (r.symbol === "SPX") ? "index"  : "equity";
@@ -2809,33 +2334,6 @@ function computeBasis(rows){
   if (!spx || !es) return null;
   return Number((es.last - spx.last).toFixed(2)); // ES - SPX
 }
-// async function pollEquitiesOnce(){
-//   try{
-//     const symbols = normEquities(WATCH);
-//     if (!symbols.length) return;
-
-//     const pairs = [];
-//     for (const sym of symbols){
-//       try { const conid = await ibConidForSymbol(sym); if (conid) pairs.push({ sym, conid }); }
-//       catch {}
-//     }
-//     if (!pairs.length) return;
-
-//     let rows = [];
-//     if (MOCK){
-//       rows = pairs.map(p => ({ symbol:p.sym, last:100+Math.random()*50, bid:0, ask:0, ts:Date.now(), iv: p.sym==="MSFT" ? 0.40 : 1.00 }));
-//     } else {
-//       const conids = pairs.map(p=>p.conid).join(",");
-//       const snaps  = await ibFetch(`/iserver/marketdata/snapshot?conids=${encodeURIComponent(conids)}&fields=31,84,86,7059`);
-//       for (const p of pairs){
-//         const s = Array.isArray(snaps) ? snaps.find(z => String(z.conid)===String(p.conid)) : null;
-//         if (!s) continue;
-//         rows.push(mapEquitySnapshot(p.sym, s));
-//       }
-//     }
-//     if (rows.length){ STATE.equities_ts = rows; wsBroadcast("equity_ts", rows); }
-//   }catch(e){ console.warn("pollEquitiesOnce:", e.message); }
-// }
 /* ===== NBBO + OCC key + raw print fanout ===== */
 const NBBO_OPT = new Map(); // key: occ -> { bid, ask, ts }
 
@@ -2869,48 +2367,6 @@ function normOptionsPrint({ ul, exp, right, strike, price, qty, nbbo }) {
   };
 }
 
-/** Fanout any message to STATE and WS.
- *  - raw prints (type==="print") → broadcast on "prints" topic (optional)
- *  - sweeps/blocks (type==="sweeps"/"blocks") → append to STATE & broadcast
- */
-// function pushAndFanout(msg) {
-//   try {
-//     // If not already enriched, infer now
-//     if (!msg.action) {
-//       const occ = toOcc(msg.symbol, msg?.option?.expiration, msg?.option?.right, msg?.option?.strike);
-//       const bid = Number(msg?.nbbo?.bid), ask = Number(msg?.nbbo?.ask);
-//       const mid = (Number.isFinite(bid) && Number.isFinite(ask) && bid>0 && ask>0) ? (bid+ask)/2 : undefined;
-//       const inf = inferActionForOptionTrade({
-//         occ,
-//         qty: Number(msg.qty) || 0,
-//         price: Number(msg.price) || 0,
-//         side: String(msg.side || "UNKNOWN"),
-//         book: { bid, ask, mid },
-//         cumulativeVol: undefined, // unknown at this stage
-//         oi: undefined,            // unknown at this stage
-//         asOfYMD: etYMD()
-//       });
-//       msg = Object.assign(msg, inf);
-//     }
-//   } catch (_) {}
-//   if (msg?.type === "sweeps") {
-//     STATE.sweeps = [...(STATE.sweeps || []), msg];
-//     wsBroadcast("sweeps", STATE.sweeps.slice(-500));
-//     return;
-//   }
-//   if (msg?.type === "blocks") {
-//     STATE.blocks = [...(STATE.blocks || []), msg];
-//     wsBroadcast("blocks", STATE.blocks.slice(-500));
-//     return;
-//   }
-//   // Optional: expose raw prints to clients
-//   if (msg?.type === "print") {
-//     // you can keep a rolling buffer if you want
-//     // e.g., STATE.prints = [...(STATE.prints||[]), msg].slice(-2000);
-//     STATE.prints = [...(STATE.prints || []), msg].slice(-2000);
-//     wsBroadcast("prints", [msg]); // light push; clients can aggregate if needed
-//   }
-// }
 // Helpers to normalize structure differences across topics
 function legFromMsg(msg) {
   // UL + leg info can be in slightly different places per vendor/topic
@@ -2953,17 +2409,7 @@ function nbboFrom(msg) {
     mid
   };
 }
-/* ========== /prices (GET) ========== */
-/**
- * GET /prices
- *   ?symbols=SPY,QQQ,ES,SPX   // optional; defaults to current watchlist equities
- *   → { rows:[{symbol,last,bid,ask,iv,ts}], es_spx_basis:number|null, ts:number }
- *
- * Notes:
- * - Uses ensureConid() so ES resolves to front-month.
- * - Preserves input order and includes placeholders when a conid can’t be resolved.
- * - In MOCK mode returns stable-ish synthetic prices.
- */
+
 app.get("/prices", async (req, res) => {
   try {
     const csv = String(req.query.symbols || "").trim();
@@ -3067,7 +2513,8 @@ function enrichWithAction(msg) {
   // If we don't have a proper option leg, skip enrichment gracefully
   if (!ul || !right || !strike || !expiry) return msg;
 
-  const occ = toOcc(ul, expiry, rightToCP(right), strike);
+  // const occ = toOcc(ul, expiry, rightToCP(right), strike);
+  const occ = optKey(ul, expiry, rightToCP(right), strike);
   const book = nbboFrom(msg);
 
   const inf = inferActionForOptionTrade({
@@ -3117,7 +2564,8 @@ function attachDayStats(msg) {
   const { ul, right, strike, expiry } = legFromMsg(msg);
   if (!ul || !right || !strike || !expiry) return msg;
 
-  const occ = toOcc(ul, expiry, rightToCP(right), strike);
+  // const occ = toOcc(ul, expiry, rightToCP(right), strike);
+  const occ = optKey(ul, expiry, right, strike);
   const ds = DAY_STATS_OPT.get(occ);
 
   if (ds) {
@@ -3136,7 +2584,8 @@ function pushAndFanout(msg) {
   try {
     // ensure enrichment exists once (prints, sweeps, blocks)
     if (!msg.action) {
-      const occ = toOcc(msg.symbol, msg?.option?.expiration, rightToCP(msg?.option?.right), msg?.option?.strike);
+      // const occ = toOcc(msg.symbol, msg?.option?.expiration, rightToCP(msg?.option?.right), msg?.option?.strike);
+      const occ = optKey(msg.symbol, msg?.option?.expiration, rightToCP(msg?.option?.right), msg?.option?.strike);
       const bid = Number(msg?.nbbo?.bid), ask = Number(msg?.nbbo?.ask);
       const mid = (Number.isFinite(bid) && Number.isFinite(ask) && bid>0 && ask>0) ? (bid+ask)/2 : undefined;
       const inf = inferActionForOptionTrade({
@@ -3164,17 +2613,6 @@ function pushAndFanout(msg) {
       null;
 
     msg.ul_px = Number.isFinite(ulPx) ? Number(ulPx) : null;
-    // const immediate = computeNotables(NOTABLES_DEFAULT);
-    // const immediate = buildNotables(
-    //   { sweeps: STATE.sweeps || [], blocks: STATE.blocks || [], prints: STATE.prints||[] },
-    //   NOTABLES_DEFAULT
-    // );    
-    // const immediate = scheduleNotables()
-    // const s = JSON.stringify(immediate);
-    // if (s !== lastNotablesJson) {
-    //   wsBroadcast("notables", immediate);
-    //   lastNotablesJson = s;
-    // }    
     scheduleNotables();
   } catch (_) {}
 
@@ -3182,7 +2620,11 @@ function pushAndFanout(msg) {
   if (msg?.type === "sweeps" || msg?.type === "blocks") {
     if (!passesPublishGate(msg)) return;   // drop quietly
   }
-
+  // normalize futures UL to "/ES" for UI consistency
+  if ((msg.ul || msg.symbol) === "ES") {
+    msg.ul = "/ES";
+    msg.symbol = "/ES";
+  }
   // keep your existing topic handling
   if (msg?.type === "sweeps") {
     STATE.sweeps = [...(STATE.sweeps || []), msg];
@@ -3207,28 +2649,6 @@ function pushAndFanout(msg) {
   wsBroadcast("headlines", [h]);
 }
 
-// Nice-to-have alias under /api:
-// app.get('/api/insights/notables', (req, res) => {
-//   try {
-//     const cfg = Object.fromEntries(
-//       Object.entries(req.query).map(([k, v]) => [k, Number(v)])
-//     );
-//     const payload = computeNotables(Object.keys(cfg).length ? cfg : NOTABLES_DEFAULT);
-//     res.json(payload);
-//   } catch (e) {
-//     res.status(500).json({ error: e?.message || 'fail' });
-//   }
-// });
-// app.get('/api/insights/notables', (req, res) => {
-//   try {
-//     const cfg = Object.fromEntries(Object.entries(req.query).map(([k,v]) => [k, Number(v)]));
-//     const payload = buildNotables(
-//       { sweeps: STATE.sweeps || [], blocks: STATE.blocks || [], prints: STATE.prints||[] },
-//       Object.keys(cfg).length ? cfg : NOTABLES_DEFAULT
-//     );
-//     res.json(payload);
-//   } catch (e) { res.status(500).json({ error: e?.message || 'fail' }); }
-// });
 app.get('/api/insights/notables', (req, res) => {
   try {
     const q = req.query || {};
@@ -3253,71 +2673,6 @@ app.get('/api/insights/notables', (req, res) => {
     res.status(500).json({ error: e?.message || 'fail' });
   }
 });
-// app.get("/api/flow/sweeps", (req,res)=>{
-//   const minNotional = Number(req.query.minNotional ?? 25_000);
-//   const limit = Number(req.query.limit ?? 200);
-//   const base = computeSweeps(9999, minNotional).slice(0, limit);
-//   const rows = base.map(r => attachDayStats({ ...r }));
-//   res.json({ rows, ts: Date.now() });
-// });
-
-// ===================== NEW pushAndFanout =====================
-// function pushAndFanout(msg) {
-//   try {
-//     // Enrich (prints, sweeps, blocks, notables) with BTO/BTC/STO/STC, at, oi, priorVol, reason
-//     if (msg && (msg.type === "print" || msg.type === "sweeps" || msg.type === "blocks" || msg.type === "notables")) {
-//       msg = enrichWithAction(msg);
-//     }
-
-//     // Also enrich headlines if they carry an option leg (so chips can show action)
-//     if (msg && msg.type === "headlines") {
-//       // single headline object or array? Support both
-//       const batch = Array.isArray(msg.data) ? msg.data : [msg];
-//       for (const h of batch) enrichWithAction(h);
-//     }
-//   } catch (e) {
-//     // swallow — we still want to fanout raw messages if inference fails
-//   }
-
-//   // Route by topic
-//   if (msg?.type === "sweeps") {
-//     STATE.sweeps = [...(STATE.sweeps || []), msg].slice(-500);
-//     wsBroadcast("sweeps", STATE.sweeps);
-//     return;
-//   }
-
-//   if (msg?.type === "blocks") {
-//     STATE.blocks = [...(STATE.blocks || []), msg].slice(-500);
-//     wsBroadcast("blocks", STATE.blocks);
-//     return;
-//   }
-
-//   if (msg?.type === "notables") {
-//     STATE.notables = [...(STATE.notables || []), msg].slice(-500);
-//     wsBroadcast("notables", STATE.notables);
-//     return;
-//   }
-
-//   if (msg?.type === "print") {
-//     STATE.prints = [...(STATE.prints || []), msg].slice(-2000);
-//     // small, frequent pushes; clients can aggregate
-//     wsBroadcast("prints", [msg]);
-//     return;
-//   }
-
-//   if (msg?.type === "headlines") {
-//     // If you publish headlines as a batch: ensure items already enriched
-//     // Attach only the top-N or pass through
-//     const arr = Array.isArray(msg.data) ? msg.data : [msg];
-//     wsBroadcast("headlines", arr);
-//     return;
-//   }
-
-//   // Fallback passthrough (if some future type shows up)
-//   if (msg?.topic && msg?.data !== undefined) {
-//     wsBroadcast(msg.topic, msg.data);
-//   }
-// }
 function toNum(x){ const n = Number(x); return Number.isFinite(n) ? n : null; }
 
 function normalizeQuoteFields(raw){
@@ -3347,416 +2702,48 @@ function normalizeQuoteFields(raw){
 }
 
 const LAST_BAR_OPT = new Map(); // conid -> { t, c, v }
+setInterval(() => ibFetchJson(`${IB_BASE}/tickle`).catch(()=>{}), 90000);
 
-// async function pollOptionsOnce() {
-//   try {
-//     // union of underlyings
-//     const ulSet = new Set(normEquities(WATCH).map(s => s.toUpperCase()));
-//     for (const o of normOptions(WATCH)) if (o?.underlying) ulSet.add(String(o.underlying).toUpperCase());
-//     const underlyings = Array.from(ulSet);
-//     if (!underlyings.length) return;
+function optKey(ul, expiration, right /* "C"|"P" or "CALL"/"PUT" */, strike) {
+  const cp = rightToCP(right);
+  const u  = String(ul).toUpperCase();
+  if (u === "ES" || u === "/ES" || FUT_ROOTS.has(u.replace(/^\//,""))) {
+    const root = futRoot(u);
+    // Use the active maturity YYYYMM if you have it; else fallback
+    const active = ACTIVE_FUT.get(root);
+    const futYYYYMM = (active?.maturity || "").slice(0,6);
+    return toFopKey(root, futYYYYMM, expiration, cp === "C" ? "CALL" : "PUT", strike);
+  }
+  return toOcc(u, expiration, cp, strike);
+}
+async function ibFopMonthsForRoot(root) {
+  // Try secdef search scoped to FUT first
+  const fut = await ibFetch(`/iserver/secdef/search?symbol=${encodeURIComponent(root)}&sectype=FUT&exchange=GLOBEX`).catch(()=>null);
+  const list = Array.isArray(fut) ? fut : (fut ? [fut] : []);
+  const months = new Set();
 
-//     const ticks = [];
-//     for (const ul of underlyings) {
-//       const conid = await ibConidForSymbol(ul); if (!conid) continue;
+  for (const r of list) {
+    const m = (r?.maturity || r?.months || "").toString(); // e.g. "202512"
+    if (/^\d{6}$/.test(m)) months.add(m);
+    // Some IB payloads expose semicolon lists in sections; sweep them too:
+    for (const s of (r?.sections || [])) {
+      if (s?.months) for (const tok of String(s.months).split(";")) if (/^\d{6}$/.test(tok)) months.add(tok);
+    }
+  }
 
-//       const snap = MOCK
-//         ? [{ "31": 100+Math.random()*50 }]
-//         : await ibFetchJson(`${IB_BASE}/iserver/marketdata/snapshot?conids=${conid}&fields=31`);
-//       const underPx = Number((Array.isArray(snap) && snap[0] && snap[0]["31"]) ?? NaN);
-//       if (!Number.isFinite(underPx)) continue;
+  const out = Array.from(months).sort();      // ascending
+  return out.slice(0, 2);                     // nearest 2
+}
 
-//       // update equity last cache so ATM builder can work immediately
-//       onTick(ul, underPx);
-
-//       let expiries = await ibOptMonthsForSymbol(ul);
-//       expiries = (expiries || []).slice(0,2);
-
-//       const grid = underPx < 50 ? 1 : 5;
-//       const atm  = Math.round(underPx / grid) * grid;
-//       const rel  = [-2,-1,0,1,2].map(i => atm + i*grid);
-
-//       for (const expiry of expiries){
-//         const yyyy = expiry.slice(0,4), mm = expiry.slice(5,7), month = `${yyyy}${mm}`;
-//         for (const right of ["C","P"]){
-//           for (const strike of rel){
-//             try {
-//               let s0;
-//               let optConid = null;
-
-//               if (MOCK) {
-//                 s0 = { "31": Math.max(0.05, Math.random()*20), "84": Math.max(0.01, Math.random()*20-0.1), "86": Math.random()*20+0.1 };
-//               } else {
-//                 const infoUrl = `${IB_BASE}/iserver/secdef/info?conid=${conid}&sectype=OPT&month=${month}&exchange=SMART&right=${right}&strike=${strike}`;
-//                 const info   = await ibFetchJson(infoUrl);
-//                 const arr    = Array.isArray(info) ? info
-//                             : Array.isArray(info?.Contracts) ? info.Contracts
-//                             : (info ? [info] : []);
-//                 optConid = arr.find(x => x?.conid)?.conid;
-//                 if (!optConid) continue;
-
-//                 // NBBO + day stats snapshot for this OCC (include vol/oi fields)
-//                 // 31=last, 84=bid, 86=ask, 7295=volume, 7635=openInterest (IB field set)
-//                 const osnap = await ibFetchJson(`${IB_BASE}/iserver/marketdata/snapshot?conids=${optConid}&fields=31,84,86,7295,7635`);
-//                 s0 = Array.isArray(osnap) && osnap[0] ? osnap[0] : {};
-//               }
-
-//               // Update NBBO cache (so classifier has context)
-//               const occ = toOcc(ul, expiry, rightToCP(right), strike);
-//               const bid0 = Number(s0["84"]), ask0 = Number(s0["86"]);
-//               if (Number.isFinite(bid0) || Number.isFinite(ask0)) {
-//                 NBBO_OPT.set(occ, { bid: bid0 || 0, ask: ask0 || 0, ts: Date.now() });
-//                 ingestOptionQuote({
-//                   occ,
-//                   bid: Number.isFinite(bid0) ? bid0 : undefined,
-//                   ask: Number.isFinite(ask0) ? ask0 : undefined,
-//                   mid: (Number.isFinite(bid0) && Number.isFinite(ask0) && bid0>0 && ask0>0) ? (bid0+ask0)/2 : undefined,
-//                   ts: Date.now()
-//                 });                
-//               }
-
-//               // Emit the UI "tick" row you already use
-//               ticks.push(mapOptionTick(ul, expiry, strike, right, s0));
-
-//               // add:
-//               updateDayStats(ul, expiry, right, strike, {
-//                 volume: toNumStrict(s0["7295"]),
-//                 oi:     toNumStrict(s0["7635"]),
-//               });
-//               // Synthesize recent prints from 1-minute bars
-//               if (!MOCK && optConid) {
-//                 let bars;
-//                 try {
-//                   bars = await ibFetchJson(`${IB_BASE}/iserver/marketdata/history?conid=${optConid}&period=1d&bar=1min&outsideRth=true`);
-//                 } catch { bars = null; }
-
-//                 const list = bars?.data || bars?.points || bars?.bars || [];
-//                 if (Array.isArray(list) && list.length) {
-//                   const lastSeen = LAST_BAR_OPT.get(optConid)?.t || 0;
-//                   const tail = list.slice(-5);
-
-//                   for (const b of tail) {
-//                     const t = Number(b.t || b.time || Date.parse(b.timestamp || "")) || 0;
-//                     if (!t || t <= lastSeen) continue;
-
-//                     const c = Number(b.c || b.close || b.price || b.last || 0);
-//                     const v = Number(b.v || b.volume || 0);
-//                     if (!(v > 0 && Number.isFinite(c))) { LAST_BAR_OPT.set(optConid, { t, c, v }); continue; }
-
-//                     // --- Fresh book + day stats for better inference (light snapshot) ---
-//                     let bid = bid0, ask = ask0, cumVol = toNumStrict(s0["7295"]), oiOpt = toNumStrict(s0["7635"]);
-//                     try {
-//                       const lite = await ibFetchJson(`${IB_BASE}/iserver/marketdata/snapshot?conids=${optConid}&fields=31,84,86,7295,7635`);
-//                       const r = Array.isArray(lite) && lite[0] ? lite[0] : {};
-//                       // prefer freshest, fallback to previous
-//                       bid = Number.isFinite(+r["84"]) ? +r["84"] : bid;
-//                       ask = Number.isFinite(+r["86"]) ? +r["86"] : ask;
-//                       cumVol = Number.isFinite(+r["7295"]) ? +r["7295"] : cumVol;
-//                       oiOpt = Number.isFinite(+r["7635"]) ? +r["7635"] : oiOpt;
-//                     } catch { /* non-fatal: keep s0 values */ }
-
-//                     // Fallback to cache if snapshot missing
-//                     const nbbo = NBBO_OPT.get(occ);
-//                     if (!Number.isFinite(bid)) bid = Number.isFinite(+nbbo?.bid) ? +nbbo.bid : undefined;
-//                     if (!Number.isFinite(ask)) ask = Number.isFinite(+nbbo?.ask) ? +nbbo.ask : undefined;
-//                     const mid = (Number.isFinite(bid) && Number.isFinite(ask) && bid>0 && ask>0) ? (bid+ask)/2 : undefined;
-
-//                     // Normalize → message
-//                     let msg = normOptionsPrint({
-//                       ul, exp: expiry, right, strike, price: c, qty: v, nbbo: { bid, ask }
-//                     });
-//                     // Ensure type + leg present (some normalizers differ)
-//                     msg.type = "print";
-//                     msg.ul = msg.ul || ul;
-//                     msg.right = msg.right || right;
-//                     msg.strike = msg.strike ?? strike;
-//                     msg.expiry = msg.expiry || expiry;
-
-//                     // Infer BTO/BTC/STO/STC (this attaches at/priorVol/oi/action/action_conf/reason)
-//                     try {
-//                       const inf = inferActionForOptionTrade({
-//                         occ,
-//                         qty: v,
-//                         price: c,
-//                         side: msg.side || "UNKNOWN",        // OK to be UNKNOWN; classifier uses 'at' too
-//                         book: { bid, ask, mid },
-//                         cumulativeVol: Number.isFinite(cumVol) ? cumVol : undefined, // day cumulative
-//                         oi: Number.isFinite(oiOpt) ? oiOpt : undefined,
-//                         asOfYMD: etYMD()
-//                       });
-//                       msg = { ...msg, ...inf };
-//                     } catch { /* swallow and keep raw msg */ }
-
-//                     pushAndFanout(msg);
-//                     maybePublishSweepOrBlock(msg); // your existing promotion logic
-
-//                     LAST_BAR_OPT.set(optConid, { t, c, v });
-//                   }
-//                 }
-//               }
-//             } catch { /* ignore one leg error to keep loop healthy */ }
-//           }
-//         }
-//       }
-//     }
-//     STATE.options_ts = ticks;
-//     wsBroadcast("options_ts", ticks);
-//   }catch(e){ console.warn("pollOptionsOnce:", e?.message || e); }
-// }
-
-// === lightweight helpers & caches (put near your other globals) ===============// ===== caches ================================================================
-// const NBBO_OPT = new Map();      // occ -> { bid, ask, ts }
-// const LAST_BAR_OPT = new Map();  // optConid -> { t, c, v }
-
-// ===== helpers ============================================================== 
-// const toNumStrict = (x) => {
-//   const n = Number(x);
-//   return Number.isFinite(n) ? n : undefined;
-// };
-
-// const rightToCP = (r) => (r === "C" ? "CALL" : "PUT");
-
-// const toOcc = (ul, expISO, rightCP, strike) =>
-//   `${String(ul).toUpperCase()} ${expISO} ${rightCP} ${String(strike)}`;
-
-// const etYMD = () => {
-//   // If you already have an ET clock util, use that instead:
-//   const d = new Date();
-//   const y = d.getUTCFullYear();
-//   const m = String(d.getUTCMonth() + 1).padStart(2, "0");
-//   const da = String(d.getUTCDate()).padStart(2, "0");
-//   return `${y}-${m}-${da}`;
-// };
-// export async function pollOptionsOnce() {
-//   let currentUL = null; // context for logging
-//   try {
-//     // --------- Build union of underlyings safely ----------
-//     const ulSet = new Set();
-//     try {
-//       const eqs = (normEquities?.(WATCH) ?? []).map((s) => String(s || "").toUpperCase()).filter(Boolean);
-//       for (const s of eqs) ulSet.add(s);
-//       const opts = normOptions?.(WATCH) ?? [];
-//       for (const o of opts) {
-//         const u = (o && o.underlying != null) ? String(o.underlying).toUpperCase() : "";
-//         if (u) ulSet.add(u);
-//       }
-//     } catch (e) {
-//       console.warn("pollOptionsOnce: failed to build underlying set", e?.message || e);
-//       return;
-//     }
-//     const underlyings = Array.from(ulSet);
-//     if (!underlyings.length) return;
-
-//     const ticks = [];
-
-//     // --------- Per-underlying loop (own try/catch) ----------
-//     for (const ul of underlyings) {
-//       currentUL = ul;
-//       try {
-//         const conid = await ibConidForSymbol(ul);
-//         if (!conid) continue;
-
-//         const snap = MOCK
-//           ? [{ "31": 100 + Math.random() * 50 }]
-//           : await ibFetchJson(`${IB_BASE}/iserver/marketdata/snapshot?conids=${conid}&fields=31`);
-
-//         const underPxRaw = Array.isArray(snap) && snap[0] ? snap[0]["31"] : NaN;
-//         const underPx = Number(underPxRaw);
-//         if (!Number.isFinite(underPx)) continue;
-
-//         // equity last cache so ATM builder works immediately
-//         try { await onTick?.(ul, underPx); } catch (e) { console.warn("pollOptionsOnce: onTick error", { ul, err: e?.message || e }); }
-
-//         // expiries
-//         let expiries = [];
-//         try {
-//           const months = await ibOptMonthsForSymbol(ul);
-//           expiries = (months || []).slice(0, 2);
-//         } catch (e) {
-//           console.warn("pollOptionsOnce: ibOptMonthsForSymbol error", { ul, err: e?.message || e });
-//           continue; // skip this UL if we can't get expiries
-//         }
-
-//         const grid = underPx < 50 ? 1 : 5;
-//         const atm  = Math.round(underPx / grid) * grid;
-//         const rel  = [-2, -1, 0, 1, 2].map((i) => atm + i * grid);
-
-//         // --------- Per-expiry loop (own try/catch) ----------
-//         for (const expiry of expiries) {
-//           try {
-//             const yyyy = String(expiry).slice(0, 4);
-//             const mm   = String(expiry).slice(5, 7);
-//             const month = `${yyyy}${mm}`;
-
-//             for (const right of ["C", "P"]) {
-//               for (const strike of rel) {
-//                 try {
-//                   let s0;
-//                   let optConid = null;
-
-//                   if (MOCK) {
-//                     s0 = {
-//                       "31": Math.max(0.05, Math.random() * 20),
-//                       "84": Math.max(0.01, Math.random() * 20 - 0.1),
-//                       "86": Math.random() * 20 + 0.1,
-//                       "7295": Math.floor(Math.random() * 5000),   // vol
-//                       "7635": Math.floor(Math.random() * 20000),  // OI
-//                     };
-//                   } else {
-//                     // resolve option conid
-//                     const infoUrl = `${IB_BASE}/iserver/secdef/info?conid=${conid}&sectype=OPT&month=${month}&exchange=SMART&right=${right}&strike=${strike}`;
-//                     const info = await ibFetchJson(infoUrl);
-//                     const arr  = Array.isArray(info) ? info
-//                                : Array.isArray(info?.Contracts) ? info.Contracts
-//                                : info ? [info] : [];
-//                     optConid = (arr.find((x) => x?.conid) || {}).conid || null;
-//                     if (!optConid) continue;
-
-//                     // NBBO + day stats for this option
-//                     // 31=last, 84=bid, 86=ask, 7295=volume, 7635=openInterest
-//                     const osnap = await ibFetchJson(
-//                       `${IB_BASE}/iserver/marketdata/snapshot?conids=${optConid}&fields=31,84,86,7295,7635`
-//                     );
-//                     s0 = Array.isArray(osnap) && osnap[0] ? osnap[0] : {};
-//                   }
-
-//                   // Update NBBO cache (so classifier has context)
-//                   const occ = toOcc(ul, expiry, rightToCP(right), strike);
-//                   const bid0 = Number(s0?.["84"]);
-//                   const ask0 = Number(s0?.["86"]);
-//                   if (Number.isFinite(bid0) || Number.isFinite(ask0)) {
-//                     NBBO_OPT.set(occ, { bid: bid0 || 0, ask: ask0 || 0, ts: Date.now() });
-//                     ingestOptionQuote?.({
-//                       occ,
-//                       bid: Number.isFinite(bid0) ? bid0 : undefined,
-//                       ask: Number.isFinite(ask0) ? ask0 : undefined,
-//                       mid: (Number.isFinite(bid0) && Number.isFinite(ask0) && bid0 > 0 && ask0 > 0)
-//                         ? (bid0 + ask0) / 2 : undefined,
-//                       ts: Date.now(),
-//                     });
-//                   }
-
-//                   // Emit the UI "tick" row you already use
-//                   ticks.push(mapOptionTick(ul, expiry, strike, right, s0));
-
-//                   // Update day stats cache for inference
-//                   updateDayStats?.(ul, expiry, right, strike, {
-//                     volume: toNumStrict(s0?.["7295"]),
-//                     oi:     toNumStrict(s0?.["7635"]),
-//                   });
-
-//                   // Synthesize recent prints from 1-minute bars → infer action → fanout
-//                   if (!MOCK && optConid) {
-//                     let bars = null;
-//                     try {
-//                       bars = await ibFetchJson(
-//                         `${IB_BASE}/iserver/marketdata/history?conid=${optConid}&period=1d&bar=1min&outsideRth=true`
-//                       );
-//                     } catch (e) {
-//                       // no-op
-//                     }
-
-//                     const list = bars?.data || bars?.points || bars?.bars || [];
-//                     if (Array.isArray(list) && list.length) {
-//                       const lastSeen = (LAST_BAR_OPT.get(optConid) || {}).t || 0;
-//                       const tail = list.slice(-5);
-
-//                       for (const b of tail) {
-//                         const t = Number(b.t || b.time || Date.parse(b.timestamp || "")) || 0;
-//                         if (!t || t <= lastSeen) continue;
-
-//                         const c = Number(b.c || b.close || b.price || b.last || 0);
-//                         const v = Number(b.v || b.volume || 0);
-//                         if (!(v > 0 && Number.isFinite(c))) {
-//                           LAST_BAR_OPT.set(optConid, { t, c, v });
-//                           continue;
-//                         }
-
-//                         // refresh book + day stats (lite)
-//                         let bid = bid0, ask = ask0;
-//                         let cumVol = toNumStrict(s0?.["7295"]);
-//                         let oiOpt  = toNumStrict(s0?.["7635"]);
-//                         try {
-//                           const lite = await ibFetchJson(
-//                             `${IB_BASE}/iserver/marketdata/snapshot?conids=${optConid}&fields=31,84,86,7295,7635`
-//                           );
-//                           const r = Array.isArray(lite) && lite[0] ? lite[0] : {};
-//                           bid    = Number.isFinite(+r["84"])    ? +r["84"]    : bid;
-//                           ask    = Number.isFinite(+r["86"])    ? +r["86"]    : ask;
-//                           cumVol = Number.isFinite(+r["7295"])  ? +r["7295"]  : cumVol;
-//                           oiOpt  = Number.isFinite(+r["7635"])  ? +r["7635"]  : oiOpt;
-//                         } catch { /* keep s0 defaults */ }
-
-//                         // Fallback to NBBO cache if fresh snapshot missing
-//                         const cached = NBBO_OPT.get(occ);
-//                         if (!Number.isFinite(bid) && cached && Number.isFinite(cached.bid)) bid = cached.bid;
-//                         if (!Number.isFinite(ask) && cached && Number.isFinite(cached.ask)) ask = cached.ask;
-//                         const mid = (Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 && ask > 0)
-//                           ? (bid + ask) / 2 : undefined;
-
-//                         // Normalize → "print" message
-//                         let msg = normOptionsPrint({
-//                           ul, exp: expiry, right, strike, price: c, qty: v, nbbo: { bid, ask }
-//                         });
-
-//                         // Ensure required fields are present
-//                         msg.type   = "print";
-//                         msg.ul     = msg.ul     || ul;
-//                         msg.right  = msg.right  || right;
-//                         msg.strike = msg.strike ?? strike;
-//                         msg.expiry = msg.expiry || expiry;
-
-//                         // Attach inferred action (BTO/BTC/STO/STC)
-//                         try {
-//                           const inf = inferActionForOptionTrade({
-//                             occ,
-//                             qty: v,
-//                             price: c,
-//                             side: msg.side || "UNKNOWN",
-//                             book: { bid, ask, mid },
-//                             cumulativeVol: Number.isFinite(cumVol) ? cumVol : undefined,
-//                             oi: Number.isFinite(oiOpt) ? oiOpt : undefined,
-//                             asOfYMD: etYMD(),
-//                           });
-//                           msg = { ...msg, ...inf };
-//                         } catch { /* keep raw msg */ }
-
-//                         pushAndFanout?.(msg);
-//                         maybePublishSweepOrBlock?.(msg);
-
-//                         // Auto-trade trigger using CURRENT underPx
-//                         try { await autoTradeOnFlow?.(msg, underPx); } catch (e) {
-//                           console.warn("pollOptionsOnce: autoTradeOnFlow error", { ul, err: e?.message || e });
-//                         }
-
-//                         LAST_BAR_OPT.set(optConid, { t, c, v });
-//                       }
-//                     }
-//                   }
-//                 } catch (err) {
-//                   console.warn("pollOptionsOnce: leg error", { ul: currentUL, expiry, right, strike, err: err?.message || err });
-//                 }
-//               }
-//             } catch (err) {
-//               console.warn("pollOptionsOnce: expiry scope error", { ul: currentUL, expiry, err: err?.message || err });
-//             }
-//           }
-//         }
-//       } catch (err) {
-//         console.warn("pollOptionsOnce: ul scope error", { ul: currentUL, err: err?.message || err });
-//         continue; // skip to next UL
-//       }
-//     }
-
-//     STATE.options_ts = ticks;
-//     wsBroadcast?.("options_ts", ticks);
-//   } catch (e) {
-//     // Top-level guard: include stack for real detail
-//     const payload = { ul: currentUL, err: e?.message || e };
-//     if (e?.stack) payload.stack = e.stack;
-//     console.warn("pollOptionsOnce: top-level error", payload);
-//   }
-// }
+function monthToApproxISO(yyyymm) {
+  const y = +yyyymm.slice(0,4), m0 = +yyyymm.slice(4,6) - 1;
+  // 3rd Friday in that month (UTC)
+  const d = new Date(Date.UTC(y, m0, 1));
+  while (d.getUTCDay() !== 5) d.setUTCDate(d.getUTCDate() + 1); // first Friday
+  d.setUTCDate(d.getUTCDate() + 14); // +2 weeks = third Friday
+  const z = (n)=>String(n).padStart(2,"0");
+  return `${d.getUTCFullYear()}-${z(d.getUTCMonth()+1)}-${z(d.getUTCDate())}`;
+}
 
 export async function pollOptionsOnce() {
   let currentUL = null; // context for logging
@@ -3786,6 +2773,144 @@ export async function pollOptionsOnce() {
     // --------- Per-underlying loop ----------
     for (const ul of underlyings) {
       currentUL = ul;
+      const sym = canon(ul);
+      // if (isFutureSym(sym)) {
+      if (isFutures(sym)) {  
+        // === FUTURES OPTIONS PATH (FOP) ===
+        const root = futRoot(sym);       // "/ES" -> "ES"
+        const active = await ibActiveFuture(root); if (!active) continue;
+
+        const underPx = await getFuturesUnderPx(root);
+        if (!Number.isFinite(underPx)) continue;
+
+        await onTick(root, underPx);     // store last; your onTick should accept "ES" as key
+        updateUnderlyingLast(root, underPx, Date.now()); // <-- add this
+
+        // Option expiry handling:
+        // For FOP, IB uses the option month YYYYMM too; you can start by using the
+        // same “first two months” approach as equities but anchored to the FUT maturity month.
+        // Simpler: just probe the next 2 calendar months from today:
+        const optMonths = await ibFopMonthsForRoot(root); // implement like ibOptMonthsForSymbol but sectype=FOP
+        const months = (optMonths || []).slice(0, 2);     // ["202511","202512"] for example
+
+        const strikes = esStrikeGrid(underPx);
+
+        for (const month of months) {
+          // If you need exact option expiry date (YYYY-MM-DD), you can fetch the chain
+          // and read expiry per contract; for now, keep a placeholder "YYYY-MM-??" or
+          // set "expiry" to a best known third Friday date finder.
+          const expiryISO = monthToApproxISO(month); // e.g., "2025-12-20" (approx)
+
+          for (const right of ["C","P"]) {
+            for (const strike of strikes) {
+              try {
+                // FOP conid lookup
+                const optConid = await resolveFopConid(root, expiryISO, right, strike);//resolveFOPConid(root, active.conid, month, right, strike);
+                if (!optConid) {
+                  console.warn("FOP resolve miss", { root, expiryISO, right, strike });
+                  return;
+                }                
+                if (!optConid) continue;
+
+                // Snapshot for NBBO + day stats
+                const osnap = await ibFetchJson(
+                  `${IB_BASE}/iserver/marketdata/snapshot?conids=${optConid}&fields=31,84,86,7295,7635`
+                );
+                const s0 = Array.isArray(osnap) && osnap[0] ? osnap[0] : {};
+
+                // NBBO cache with FOP key
+                // const key = toFopKey(root, active.maturity?.slice(0,6) || month, expiryISO, right==="C"?"CALL":"PUT", strike);
+                const key = optKey(root, expiryISO, right, strike);
+                const bid0 = Number(s0["84"]), ask0 = Number(s0["86"]);
+                if (Number.isFinite(bid0) || Number.isFinite(ask0)) {
+                  NBBO_OPT.set(key, { bid: bid0 || 0, ask: ask0 || 0, ts: Date.now() });
+                  ingestOptionQuote({
+                    occ: key, // reuse field name 'occ' in your code paths
+                    bid: Number.isFinite(bid0) ? bid0 : undefined,
+                    ask: Number.isFinite(ask0) ? ask0 : undefined,
+                    mid: (Number.isFinite(bid0)&&Number.isFinite(ask0)&&bid0>0&&ask0>0) ? (bid0+ask0)/2 : undefined,
+                    ts: Date.now(),
+                  });
+                }
+
+                // UI tick row (use your mapper or a FOP variant)
+                ticks.push(mapOptionTick(root, expiryISO, strike, right, s0)); // keep the same shape you expect
+
+                // Day stats for inference
+                updateDayStats(root, expiryISO, right, strike, {
+                  volume: toNumStrict(s0["7295"]),
+                  oi:     toNumStrict(s0["7635"]),
+                });
+
+                // Build synthetic prints from 1m bars (same as before)
+                let bars=null;
+                try{
+                  bars = await ibFetchJson(`${IB_BASE}/iserver/marketdata/history?conid=${optConid}&period=1d&bar=1min&outsideRth=true`);
+                }catch{}
+                const list = bars?.data || bars?.points || bars?.bars || [];
+                if (Array.isArray(list) && list.length){
+                  const lastSeen = (LAST_BAR_OPT.get(optConid) || {}).t || 0;
+                  const tail = list.slice(-5);
+                  for (const b of tail){
+                    const t = Number(b.t || b.time || Date.parse(b.timestamp||"")) || 0;
+                    if (!t || t <= lastSeen) continue;
+
+                    const c = Number(b.c || b.close || b.price || b.last || 0);
+                    const v = Number(b.v || b.volume || 0);
+                    if (!(v>0 && Number.isFinite(c))) { LAST_BAR_OPT.set(optConid, { t, c, v }); continue; }
+
+                    // refresh light snapshot (optional)
+                    let bid = bid0, ask = ask0, cumVol = toNumStrict(s0["7295"]), oiOpt = toNumStrict(s0["7635"]);
+                    try {
+                      const lite = await ibFetchJson(`${IB_BASE}/iserver/marketdata/snapshot?conids=${optConid}&fields=31,84,86,7295,7635`);
+                      const r = Array.isArray(lite) && lite[0] ? lite[0] : {};
+                      bid   = Number.isFinite(+r["84"]) ? +r["84"] : bid;
+                      ask   = Number.isFinite(+r["86"]) ? +r["86"] : ask;
+                      cumVol= Number.isFinite(+r["7295"]) ? +r["7295"] : cumVol;
+                      oiOpt = Number.isFinite(+r["7635"]) ? +r["7635"] : oiOpt;
+                    } catch {}
+
+                    const nbbo = NBBO_OPT.get(key) || {};
+                    if (!Number.isFinite(bid) && Number.isFinite(nbbo.bid)) bid = nbbo.bid;
+                    if (!Number.isFinite(ask) && Number.isFinite(nbbo.ask)) ask = nbbo.ask;
+                    const mid = (Number.isFinite(bid)&&Number.isFinite(ask)&&bid>0&&ask>0) ? (bid+ask)/2 : undefined;
+
+                    // Normalize like before; keep fields your inferer expects
+                    let msg = normOptionsPrint({
+                      ul: root, exp: expiryISO, right, strike, price: c, qty: v, nbbo: { bid, ask }
+                    });
+                    msg.type = "print";
+
+                    // Infer action
+                    try{
+                      const inf = inferActionForOptionTrade({
+                        occ: key, qty: v, price: c, side: msg.side || "UNKNOWN",
+                        book: { bid, ask, mid },
+                        cumulativeVol: Number.isFinite(cumVol) ? cumVol : undefined,
+                        oi: Number.isFinite(oiOpt) ? oiOpt : undefined,
+                        asOfYMD: etYMD(),
+                      });
+                      msg = { ...msg, ...inf };
+                    }catch{}
+
+                    pushAndFanout(msg);
+                    maybePublishSweepOrBlock(msg);
+
+                    // AUTOTRADE: use **futures ATR** and **futures last**:
+                    await autoTradeOnFlow(msg, underPx); // your existing function works; see §6 tweak
+
+                    LAST_BAR_OPT.set(optConid, { t, c, v });
+                  }
+                }
+              }catch(err){
+                console.warn("FOP leg error", { root, month, right, strike, err: err?.message || err });
+              }
+            }
+          }
+        }
+        continue; // done with /ES path
+      }
+
       try {
         const conid = await ibConidForSymbol(ul);
         if (!conid) continue;
@@ -3860,7 +2985,7 @@ export async function pollOptionsOnce() {
                     s0 = (Array.isArray(osnap) && osnap[0]) ? osnap[0] : {};
                   }
 
-                  const occ  = toOcc(ul, expiry, rightToCP(right), strike);
+                  const occ  = optKey(ul, expiry, rightToCP(right), strike); //toOcc(ul, expiry, rightToCP(right), strike);
                   const bid0 = Number(s0 && s0["84"]);
                   const ask0 = Number(s0 && s0["86"]);
 
@@ -4001,573 +3126,6 @@ export async function pollOptionsOnce() {
   }
 }
 
-// export async function pollOptionsOnce() {
-//   let currentUL = null; // <-- track context safely for logging
-//   try {
-//     // union of underlyings from equities + options WATCH list
-//     const ulSet = new Set(normEquities(WATCH).map((s) => s.toUpperCase()));
-//     for (const o of normOptions(WATCH)) if (o?.underlying) ulSet.add(String(o.underlying).toUpperCase());
-//     const underlyings = Array.from(ulSet);
-//     if (!underlyings.length) return;
-
-//     const ticks = [];
-//     for (const ul of underlyings) {
-//       currentUL = ul; // <-- set context at loop top
-
-//       const conid = await ibConidForSymbol(ul);
-//       if (!conid) continue;
-
-//       const snap = MOCK
-//         ? [{ "31": 100 + Math.random() * 50 }]
-//         : await ibFetchJson(`${IB_BASE}/iserver/marketdata/snapshot?conids=${conid}&fields=31`);
-//       const underPx = Number((Array.isArray(snap) && snap[0] && snap[0]["31"]) ?? NaN);
-//       if (!Number.isFinite(underPx)) continue;
-
-//       // update equity last cache so ATM builder works immediately
-//       await onTick(ul, underPx);
-
-//       let expiries = await ibOptMonthsForSymbol(ul);
-//       expiries = (expiries || []).slice(0, 2);
-
-//       const grid = underPx < 50 ? 1 : 5;
-//       const atm = Math.round(underPx / grid) * grid;
-//       const rel = [-2, -1, 0, 1, 2].map((i) => atm + i * grid);
-
-//       for (const expiry of expiries) {
-//         const yyyy = expiry.slice(0, 4);
-//         const mm = expiry.slice(5, 7);
-//         const month = `${yyyy}${mm}`;
-
-//         for (const right of ["C", "P"]) {
-//           for (const strike of rel) {
-//             try {
-//               let s0;
-//               let optConid = null;
-
-//               if (MOCK) {
-//                 s0 = {
-//                   "31": Math.max(0.05, Math.random() * 20),
-//                   "84": Math.max(0.01, Math.random() * 20 - 0.1),
-//                   "86": Math.random() * 20 + 0.1,
-//                   "7295": Math.floor(Math.random() * 5000),  // volume
-//                   "7635": Math.floor(Math.random() * 20000), // open interest
-//                 };
-//               } else {
-//                 // resolve option conid at given month/right/strike
-//                 const infoUrl = `${IB_BASE}/iserver/secdef/info?conid=${conid}&sectype=OPT&month=${month}&exchange=SMART&right=${right}&strike=${strike}`;
-//                 const info = await ibFetchJson(infoUrl);
-//                 const arr = Array.isArray(info)
-//                   ? info
-//                   : Array.isArray(info?.Contracts)
-//                   ? info.Contracts
-//                   : info
-//                   ? [info]
-//                   : [];
-//                 optConid = (arr.find((x) => x?.conid) || {}).conid || null;
-//                 if (!optConid) continue;
-
-//                 // NBBO + day stats for this option
-//                 // 31=last, 84=bid, 86=ask, 7295=volume, 7635=openInterest
-//                 const osnap = await ibFetchJson(
-//                   `${IB_BASE}/iserver/marketdata/snapshot?conids=${optConid}&fields=31,84,86,7295,7635`
-//                 );
-//                 s0 = Array.isArray(osnap) && osnap[0] ? osnap[0] : {};
-//               }
-
-//               // Update NBBO cache (so classifier has context)
-//               const occ = toOcc(ul, expiry, rightToCP(right), strike);
-//               const bid0 = Number(s0["84"]);
-//               const ask0 = Number(s0["86"]);
-//               if (Number.isFinite(bid0) || Number.isFinite(ask0)) {
-//                 NBBO_OPT.set(occ, { bid: bid0 || 0, ask: ask0 || 0, ts: Date.now() });
-//                 ingestOptionQuote({
-//                   occ,
-//                   bid: Number.isFinite(bid0) ? bid0 : undefined,
-//                   ask: Number.isFinite(ask0) ? ask0 : undefined,
-//                   mid:
-//                     Number.isFinite(bid0) && Number.isFinite(ask0) && bid0 > 0 && ask0 > 0
-//                       ? (bid0 + ask0) / 2
-//                       : undefined,
-//                   ts: Date.now(),
-//                 });
-//               }
-
-//               // Emit the UI "tick" row you already use
-//               ticks.push(mapOptionTick(ul, expiry, strike, right, s0));
-
-//               // Update day stats cache for inference (volume/open interest)
-//               updateDayStats(ul, expiry, right, strike, {
-//                 volume: toNumStrict(s0["7295"]),
-//                 oi: toNumStrict(s0["7635"]),
-//               });
-
-//               // Synthesize recent prints from 1-minute bars → infer action → fanout
-//               if (!MOCK && optConid) {
-//                 let bars;
-//                 try {
-//                   bars = await ibFetchJson(
-//                     `${IB_BASE}/iserver/marketdata/history?conid=${optConid}&period=1d&bar=1min&outsideRth=true`
-//                   );
-//                 } catch {
-//                   bars = null;
-//                 }
-
-//                 const list = bars?.data || bars?.points || bars?.bars || [];
-//                 if (Array.isArray(list) && list.length) {
-//                   const lastSeen = (LAST_BAR_OPT.get(optConid) || {}).t || 0;
-//                   const tail = list.slice(-5); // only the freshest few
-
-//                   for (const b of tail) {
-//                     const t = Number(b.t || b.time || Date.parse(b.timestamp || "")) || 0;
-//                     if (!t || t <= lastSeen) continue;
-
-//                     const c = Number(b.c || b.close || b.price || b.last || 0);
-//                     const v = Number(b.v || b.volume || 0);
-//                     if (!(v > 0 && Number.isFinite(c))) {
-//                       LAST_BAR_OPT.set(optConid, { t, c, v });
-//                       continue;
-//                     }
-
-//                     // Pull a light snapshot to refresh bid/ask + cumulative vol/oi
-//                     let bid = bid0;
-//                     let ask = ask0;
-//                     let cumVol = toNumStrict(s0["7295"]);
-//                     let oiOpt = toNumStrict(s0["7635"]);
-//                     try {
-//                       const lite = await ibFetchJson(
-//                         `${IB_BASE}/iserver/marketdata/snapshot?conids=${optConid}&fields=31,84,86,7295,7635`
-//                       );
-//                       const r = Array.isArray(lite) && lite[0] ? lite[0] : {};
-//                       bid = Number.isFinite(+r["84"]) ? +r["84"] : bid;
-//                       ask = Number.isFinite(+r["86"]) ? +r["86"] : ask;
-//                       cumVol = Number.isFinite(+r["7295"]) ? +r["7295"] : cumVol;
-//                       oiOpt = Number.isFinite(+r["7635"]) ? +r["7635"] : oiOpt;
-//                     } catch {
-//                       // keep s0 defaults
-//                     }
-
-//                     // Fallback to NBBO cache if fresh snapshot missing
-//                     const nbbo = NBBO_OPT.get(occ);
-//                     if (!Number.isFinite(bid) && nbbo && Number.isFinite(nbbo.bid)) bid = nbbo.bid;
-//                     if (!Number.isFinite(ask) && nbbo && Number.isFinite(nbbo.ask)) ask = nbbo.ask;
-//                     const mid =
-//                       Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 && ask > 0
-//                         ? (bid + ask) / 2
-//                         : undefined;
-
-//                     // Normalize → "print" message
-//                     let msg = normOptionsPrint({
-//                       ul,
-//                       exp: expiry,
-//                       right,
-//                       strike,
-//                       price: c,
-//                       qty: v,
-//                       nbbo: { bid, ask },
-//                     });
-
-//                     // Ensure required fields are present
-//                     msg.type = "print";
-//                     msg.ul = msg.ul || ul;
-//                     msg.right = msg.right || right;
-//                     msg.strike = msg.strike ?? strike;
-//                     msg.expiry = msg.expiry || expiry;
-
-//                     // Attach inferred action (BTO/BTC/STO/STC) + confidence + reason
-//                     try {
-//                       const inf = inferActionForOptionTrade({
-//                         occ,
-//                         qty: v,
-//                         price: c,
-//                         side: msg.side || "UNKNOWN",
-//                         book: { bid, ask, mid },
-//                         cumulativeVol: Number.isFinite(cumVol) ? cumVol : undefined,
-//                         oi: Number.isFinite(oiOpt) ? oiOpt : undefined,
-//                         asOfYMD: etYMD(),
-//                       });
-//                       msg = { ...msg, ...inf };
-//                     } catch {
-//                       // keep raw msg if inference fails
-//                     }
-
-//                     pushAndFanout(msg);
-//                     maybePublishSweepOrBlock(msg);
-
-//                     // Auto-trade trigger (use the CURRENT underlying price computed earlier)
-//                     await autoTradeOnFlow(msg, underPx);
-
-//                     LAST_BAR_OPT.set(optConid, { t, c, v });
-//                   }
-//                 }
-//               }
-//             } catch (err) {
-//               // keep loop healthy; include context
-//               console.warn("pollOptionsOnce: leg error", { ul: currentUL, expiry, right, strike, err: err?.message || err });
-//             }
-//           }
-//         }
-//       }
-//     }
-
-//     STATE.options_ts = ticks;
-//     wsBroadcast("options_ts", ticks);
-//   } catch (e) {
-//     // Use the safe context variable instead of 'ul'
-//     console.warn("pollOptionsOnce: top-level error", { ul: currentUL, err: e?.message || e });
-//   }
-// }
-
-// =============== integrated poller ===========================================
-// export async function pollOptionsOnce() {
-//   let currentUL = null; // <-- track context safely for logging
-//   try {
-//     // union of underlyings from equities + options WATCH list
-//     const ulSet = new Set(normEquities(WATCH).map((s) => s.toUpperCase()));
-//     for (const o of normOptions(WATCH)) if (o?.underlying) ulSet.add(String(o.underlying).toUpperCase());
-//     const underlyings = Array.from(ulSet);
-//     if (!underlyings.length) return;
-
-//     const ticks = [];
-//     for (const ul of underlyings) {
-//       currentUL = ul; // <-- set context at loop top
-
-//       const conid = await ibConidForSymbol(ul);
-//       if (!conid) continue;
-
-//       const snap = MOCK
-//         ? [{ "31": 100 + Math.random() * 50 }]
-//         : await ibFetchJson(`${IB_BASE}/iserver/marketdata/snapshot?conids=${conid}&fields=31`);
-//       const underPx = Number((Array.isArray(snap) && snap[0] && snap[0]["31"]) ?? NaN);
-//       if (!Number.isFinite(underPx)) continue;
-
-//       // update equity last cache so ATM builder works immediately
-//       await onTick(ul, underPx);
-
-//       let expiries = await ibOptMonthsForSymbol(ul);
-//       expiries = (expiries || []).slice(0, 2);
-
-//       const grid = underPx < 50 ? 1 : 5;
-//       const atm = Math.round(underPx / grid) * grid;
-//       const rel = [-2, -1, 0, 1, 2].map((i) => atm + i * grid);
-
-//       for (const expiry of expiries) {
-//         const yyyy = expiry.slice(0, 4);
-//         const mm = expiry.slice(5, 7);
-//         const month = `${yyyy}${mm}`;
-
-//         for (const right of ["C", "P"]) {
-//           for (const strike of rel) {
-//             try {
-//               let s0;
-//               let optConid = null;
-
-//               if (MOCK) {
-//                 s0 = {
-//                   "31": Math.max(0.05, Math.random() * 20),
-//                   "84": Math.max(0.01, Math.random() * 20 - 0.1),
-//                   "86": Math.random() * 20 + 0.1,
-//                   "7295": Math.floor(Math.random() * 5000),  // volume
-//                   "7635": Math.floor(Math.random() * 20000), // open interest
-//                 };
-//               } else {
-//                 // resolve option conid at given month/right/strike
-//                 const infoUrl = `${IB_BASE}/iserver/secdef/info?conid=${conid}&sectype=OPT&month=${month}&exchange=SMART&right=${right}&strike=${strike}`;
-//                 const info = await ibFetchJson(infoUrl);
-//                 const arr = Array.isArray(info)
-//                   ? info
-//                   : Array.isArray(info?.Contracts)
-//                   ? info.Contracts
-//                   : info
-//                   ? [info]
-//                   : [];
-//                 optConid = (arr.find((x) => x?.conid) || {}).conid || null;
-//                 if (!optConid) continue;
-
-//                 // NBBO + day stats for this option
-//                 // 31=last, 84=bid, 86=ask, 7295=volume, 7635=openInterest
-//                 const osnap = await ibFetchJson(
-//                   `${IB_BASE}/iserver/marketdata/snapshot?conids=${optConid}&fields=31,84,86,7295,7635`
-//                 );
-//                 s0 = Array.isArray(osnap) && osnap[0] ? osnap[0] : {};
-//               }
-
-//               // Update NBBO cache (so classifier has context)
-//               const occ = toOcc(ul, expiry, rightToCP(right), strike);
-//               const bid0 = Number(s0["84"]);
-//               const ask0 = Number(s0["86"]);
-//               if (Number.isFinite(bid0) || Number.isFinite(ask0)) {
-//                 NBBO_OPT.set(occ, { bid: bid0 || 0, ask: ask0 || 0, ts: Date.now() });
-//                 ingestOptionQuote({
-//                   occ,
-//                   bid: Number.isFinite(bid0) ? bid0 : undefined,
-//                   ask: Number.isFinite(ask0) ? ask0 : undefined,
-//                   mid:
-//                     Number.isFinite(bid0) && Number.isFinite(ask0) && bid0 > 0 && ask0 > 0
-//                       ? (bid0 + ask0) / 2
-//                       : undefined,
-//                   ts: Date.now(),
-//                 });
-//               }
-
-//               // Emit the UI "tick" row you already use
-//               ticks.push(mapOptionTick(ul, expiry, strike, right, s0));
-
-//               // Update day stats cache for inference (volume/open interest)
-//               updateDayStats(ul, expiry, right, strike, {
-//                 volume: toNumStrict(s0["7295"]),
-//                 oi: toNumStrict(s0["7635"]),
-//               });
-
-//               // Synthesize recent prints from 1-minute bars → infer action → fanout
-//               if (!MOCK && optConid) {
-//                 let bars;
-//                 try {
-//                   bars = await ibFetchJson(
-//                     `${IB_BASE}/iserver/marketdata/history?conid=${optConid}&period=1d&bar=1min&outsideRth=true`
-//                   );
-//                 } catch {
-//                   bars = null;
-//                 }
-
-//                 const list = bars?.data || bars?.points || bars?.bars || [];
-//                 if (Array.isArray(list) && list.length) {
-//                   const lastSeen = (LAST_BAR_OPT.get(optConid) || {}).t || 0;
-//                   const tail = list.slice(-5); // only the freshest few
-
-//                   for (const b of tail) {
-//                     const t = Number(b.t || b.time || Date.parse(b.timestamp || "")) || 0;
-//                     if (!t || t <= lastSeen) continue;
-
-//                     const c = Number(b.c || b.close || b.price || b.last || 0);
-//                     const v = Number(b.v || b.volume || 0);
-//                     if (!(v > 0 && Number.isFinite(c))) {
-//                       LAST_BAR_OPT.set(optConid, { t, c, v });
-//                       continue;
-//                     }
-
-//                     // Pull a light snapshot to refresh bid/ask + cumulative vol/oi
-//                     let bid = bid0;
-//                     let ask = ask0;
-//                     let cumVol = toNumStrict(s0["7295"]);
-//                     let oiOpt = toNumStrict(s0["7635"]);
-//                     try {
-//                       const lite = await ibFetchJson(
-//                         `${IB_BASE}/iserver/marketdata/snapshot?conids=${optConid}&fields=31,84,86,7295,7635`
-//                       );
-//                       const r = Array.isArray(lite) && lite[0] ? lite[0] : {};
-//                       bid = Number.isFinite(+r["84"]) ? +r["84"] : bid;
-//                       ask = Number.isFinite(+r["86"]) ? +r["86"] : ask;
-//                       cumVol = Number.isFinite(+r["7295"]) ? +r["7295"] : cumVol;
-//                       oiOpt = Number.isFinite(+r["7635"]) ? +r["7635"] : oiOpt;
-//                     } catch {
-//                       // keep s0 defaults
-//                     }
-
-//                     // Fallback to NBBO cache if fresh snapshot missing
-//                     const nbbo = NBBO_OPT.get(occ);
-//                     if (!Number.isFinite(bid) && nbbo && Number.isFinite(nbbo.bid)) bid = nbbo.bid;
-//                     if (!Number.isFinite(ask) && nbbo && Number.isFinite(nbbo.ask)) ask = nbbo.ask;
-//                     const mid =
-//                       Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 && ask > 0
-//                         ? (bid + ask) / 2
-//                         : undefined;
-
-//                     // Normalize → "print" message
-//                     let msg = normOptionsPrint({
-//                       ul,
-//                       exp: expiry,
-//                       right,
-//                       strike,
-//                       price: c,
-//                       qty: v,
-//                       nbbo: { bid, ask },
-//                     });
-
-//                     // Ensure required fields are present
-//                     msg.type = "print";
-//                     msg.ul = msg.ul || ul;
-//                     msg.right = msg.right || right;
-//                     msg.strike = msg.strike ?? strike;
-//                     msg.expiry = msg.expiry || expiry;
-
-//                     // Attach inferred action (BTO/BTC/STO/STC) + confidence + reason
-//                     try {
-//                       const inf = inferActionForOptionTrade({
-//                         occ,
-//                         qty: v,
-//                         price: c,
-//                         side: msg.side || "UNKNOWN",
-//                         book: { bid, ask, mid },
-//                         cumulativeVol: Number.isFinite(cumVol) ? cumVol : undefined,
-//                         oi: Number.isFinite(oiOpt) ? oiOpt : undefined,
-//                         asOfYMD: etYMD(),
-//                       });
-//                       msg = { ...msg, ...inf }; // adds: action, action_conf, reason, at/priorVol/oi, etc.
-//                     } catch {
-//                       // keep raw msg if inference fails
-//                     }
-
-//                     pushAndFanout(msg);
-//                     maybePublishSweepOrBlock(msg); // your existing promotion logic
-
-//                     // Auto-trade trigger (use the CURRENT underlying price you computed earlier)
-//                     await autoTradeOnFlow(msg, underPx);
-
-//                     LAST_BAR_OPT.set(optConid, { t, c, v });
-//                   }
-//                 }
-//               }
-//             } catch (e) {
-//               // Use the safe context variable instead of 'ul'
-//               console.warn("pollOptionsOnce: top-level error", { ul: currentUL, err: e?.message || e });
-//             }
-//           }
-//         }
-//       }
-//     }
-
-//     STATE.options_ts = ticks;
-//     wsBroadcast("options_ts", ticks);
-//   } catch (e) {
-//     console.warn("pollOptionsOnce: top-level error", { ul: currentUL, err: e?.message || e });
-//   }
-// }
-
-// async function pollOptionsOnce(){
-//   try{
-//     // union of underlyings
-//     const ulSet = new Set(normEquities(WATCH).map(s => s.toUpperCase()));
-//     for (const o of normOptions(WATCH)) if (o?.underlying) ulSet.add(String(o.underlying).toUpperCase());
-//     const underlyings = Array.from(ulSet);
-//     if (!underlyings.length) return;
-
-//     const ticks = [];
-//     for (const ul of underlyings){
-//       const conid = await ibConidForSymbol(ul); if (!conid) continue;
-
-//       const snap = MOCK
-//         ? [{ "31": 100+Math.random()*50 }]
-//         : await ibFetchJson(`${IB_BASE}/iserver/marketdata/snapshot?conids=${conid}&fields=31`);
-//       const underPx = Number((Array.isArray(snap) && snap[0] && snap[0]["31"]) ?? NaN);
-//       if (!Number.isFinite(underPx)) continue;
-
-//       // update equity last cache so ATM builder can work immediately
-//       onTick(ul, underPx);
-//       let expiries = await ibOptMonthsForSymbol(ul);
-//       expiries = (expiries || []).slice(0,2);
-
-//       const grid = underPx < 50 ? 1 : 5;
-//       const atm  = Math.round(underPx / grid) * grid;
-//       const rel  = [-2,-1,0,1,2].map(i => atm + i*grid);
-
-//       for (const expiry of expiries){
-//         const yyyy = expiry.slice(0,4), mm = expiry.slice(5,7), month = `${yyyy}${mm}`;
-//         for (const right of ["C","P"]){
-//           for (const strike of rel){
-//             try {
-//               let s0;
-//               let optConid = null;
-
-//               if (MOCK) {
-//                 s0 = { "31": Math.max(0.05, Math.random()*20), "84": Math.max(0.01, Math.random()*20-0.1), "86": Math.random()*20+0.1 };
-//               } else {
-//                 const infoUrl = `${IB_BASE}/iserver/secdef/info?conid=${conid}&sectype=OPT&month=${month}&exchange=SMART&right=${right}&strike=${strike}`;
-//                 const info   = await ibFetchJson(infoUrl);
-//                 const arr    = Array.isArray(info) ? info
-//                             : Array.isArray(info?.Contracts) ? info.Contracts
-//                             : (info ? [info] : []);
-//                 optConid = arr.find(x => x?.conid)?.conid;
-//                 if (!optConid) continue;
-
-//                 // 1) NBBO snapshot for this OCC
-//                 const osnap = await ibFetchJson(`${IB_BASE}/iserver/marketdata/snapshot?conids=${optConid}&fields=31,84,86,7295,7635`);
-//                 s0 = Array.isArray(osnap) && osnap[0] ? osnap[0] : {};
-//               }
-
-//               // Update NBBO cache (so classifyAggressor / intent has context)
-//               const occ = toOcc(ul, expiry, right, strike);
-//               const bid = Number(s0["84"]), ask = Number(s0["86"]);
-//               if (Number.isFinite(bid) || Number.isFinite(ask)) {
-//                 NBBO_OPT.set(occ, { bid: bid || 0, ask: ask || 0, ts: Date.now() });
-//               }
-
-//               // 2) Emit the UI "tick" row you already use (keeps your “Options (read-only demo)” table healthy)
-//               ticks.push(mapOptionTick(ul, expiry, strike, right, s0));
-
-//               // 3) Turn 1-minute bars into prints (qty = volume, price = close)
-//               if (!MOCK && optConid) {
-//                 let bars;
-//                 try {
-//                   // history endpoint: synthesize prints from the last few minutes only
-//                   bars = await ibFetchJson(`${IB_BASE}/iserver/marketdata/history?conid=${optConid}&period=1d&bar=1min&outsideRth=true`);
-//                 } catch (_) {
-//                   // If history is temporarily unavailable (e.g., IB 503), skip quietly
-//                   bars = null;
-//                 }
-
-//                 const list = bars?.data || bars?.points || bars?.bars || [];
-//                 if (Array.isArray(list) && list.length) {
-//                   const lastSeen = LAST_BAR_OPT.get(optConid)?.t || 0;
-//                   // Only the tail to avoid flooding + ensure monotonicity
-//                   const tail = list.slice(-5);
-//                   for (const b of tail) {
-//                     const t = Number(b.t || b.time || Date.parse(b.timestamp || "")) || 0;
-//                     if (!t || t <= lastSeen) continue;
-
-//                     const c = Number(b.c || b.close || b.price || b.last || 0);
-//                     const v = Number(b.v || b.volume || 0);
-
-//                     if (v > 0 && Number.isFinite(c)) {
-//                       const nbbo = NBBO_OPT.get(occ);
-//                       // === This is the bit you asked to “show integration” for ===
-//                       // const msg = normOptionsPrint({
-//                       //   ul, exp: expiry, right, strike, price: c, qty: v, nbbo
-//                       // });
-//                       const bidN = Number(nbbo?.bid);
-//                       const askN = Number(nbbo?.ask);
-//                       const midN = (Number.isFinite(bidN) && Number.isFinite(askN) && bidN > 0 && askN > 0) ? (bidN + askN) / 2 : undefined;
-
-//                       // IB sometimes exposes cumulative volume / OI on the option snapshot; pull if present
-//                       const cumVol = toNumStrict(s0["7295"] ?? s0["volume"] ?? s0["tradingVolume"]);
-//                       const oiOpt  = toNumStrict(s0["7635"] ?? s0["openInterest"] ?? s0["open_interest"]);
-
-//                       let msg = normOptionsPrint({
-//                         ul, exp: expiry, right, strike, price: c, qty: v, nbbo
-//                       });
-
-//                       // Infer BTO/BTC/STO/STC and attach to the print
-//                       try {
-//                         const inf = inferActionForOptionTrade({
-//                           occ,
-//                           qty: v,
-//                           price: c,
-//                           side: msg.side || "UNKNOWN",
-//                           book: { bid: bidN, ask: askN, mid: midN },
-//                           cumulativeVol: cumVol,
-//                           oi: oiOpt,
-//                           asOfYMD: etYMD()
-//                         });
-//                         msg = { ...msg, ...inf }; // add: at, priorVol, oi, action, action_conf, reason
-//                       } catch (_) { /* non-fatal */ }
-
-//                       pushAndFanout(msg);
-//                       // promote large prints to sweeps/blocks (thresholded)
-//                       maybePublishSweepOrBlock(msg);
-//                     }
-//                     LAST_BAR_OPT.set(optConid, { t, c, v });
-//                   }
-//                 }
-//               }
-//             } catch (_) { /* ignore one leg error to keep loop healthy */ }
-//           }
-//         }
-//       }
-//     }
-//     STATE.options_ts = ticks;
-//     wsBroadcast("options_ts", ticks);
-//   }catch(e){ console.warn("pollOptionsOnce:", e.message); }
-// }
-
 /* ==== Tape classification config (tune freely) ==== */
 const TAPE_CFG = {
   sweep: {
@@ -4591,28 +3149,6 @@ const TAPE_CFG = {
   }
 };
 
-// type OptPrint = {
-//   underlying: string;
-//   right: "C" | "P";
-//   strike: number;
-//   expiration: string;          // "YYYY-MM-DD"
-//   last: number; bid?: number; ask?: number;
-//   size?: number;               // contracts; synthesize if missing
-//   venue?: string;              // "ibkr","tradier","cboe", etc.; synth if missing
-//   ts: number;                  // ms epoch
-// };
-/* ================= WATCHLIST ROUTES ================= */
-// app.get("/watchlist/equities", (_req, res) => {
-//   res.json({ equities: STATE.watchlist.equities || [] });
-// });
-
-// app.post("/watchlist/equities", express.json(), async (req, res) => {
-//   const raw = (req.body?.symbol || "").toString().trim();
-//   if (!raw) return res.status(400).json({ error: "symbol required" });
-//   await watchAddEquities([normalizeSymbol(raw)]);
-//   wsBroadcast("watchlist", getWatchlist());
-//   res.json({ ok: true, watchlist: getWatchlist() });
-// });
 app.post("/watchlist/equities", (req, res) => {
   const sym = String(req.body?.symbol || "").toUpperCase().replace(/^\//, "");
   if (!/^[A-Z0-9.\-_/]{1,10}$/.test(sym)) {
@@ -4642,44 +3178,6 @@ app.get("/ib/health", async (_req, res) => {
   }
 });
 
-// app.post("/watchlist/equities", express.json(), (req, res) => {
-//   const raw = (req.body?.symbol || "").toString().trim();
-//   if (!raw) return res.status(400).json({ error: "symbol required" });
-//   const sym = raw.toUpperCase();
-
-//   const set = new Set(STATE.watchlist.equities || []);
-//   set.add(sym);
-//   STATE.watchlist.equities = Array.from(set);
-
-//   res.json({ ok: true, equities: STATE.watchlist.equities });
-// });
-// app.post("/watchlist/equities", express.json(), async (req, res) => {
-//   const raw = (req.body?.symbol || "").toString().trim();
-//   if (!raw) return res.status(400).json({ error: "symbol required" });
-//   await watchAddEquities([raw.toUpperCase()]);
-//   wsBroadcast("watchlist", getWatchlist());
-//   res.json({ ok: true, watchlist: getWatchlist() });
-// });
-
-// app.delete("/watchlist/equities/:symbol", (req, res) => {
-//   const sym = (req.params.symbol || "").toUpperCase();
-//   const next = (STATE.watchlist.equities || []).filter(s => s !== sym);
-//   STATE.watchlist.equities = next;
-//   res.json({ ok: true, equities: next });
-// });
-// app.delete("/watchlist/equities/:symbol", async (req, res) => {
-//   const sym = (req.params.symbol || "").toUpperCase();
-//   WATCH.equities.delete(sym);
-//   wsBroadcast("watchlist", getWatchlist());
-//   res.json({ ok: true, watchlist: getWatchlist() });
-// });
-// app.delete("/watchlist/equities/:symbol", async (req, res) => {
-//   const sym = normalizeSymbol(req.params.symbol || "");
-//   WATCH.equities.delete(sym);
-//   wsBroadcast("watchlist", getWatchlist());
-//   res.json({ ok: true, watchlist: getWatchlist() });
-// });
-
 // Remove equity (persists to file)
 app.delete("/watchlist/equities/:sym", (req, res) => {
   const sym = String(req.params.sym || "").toUpperCase().replace(/^\//, "");
@@ -4692,18 +3190,6 @@ app.delete("/watchlist/equities/:sym", (req, res) => {
   res.json({ ok: true, ...payload });
 });
 
-/* ---------- Tick updates: update lastBySymbol then (optionally) rebroadcast ---------- */
-// async function onTick(symbol, last) {
-//   lastBySymbol[symbol.toUpperCase().replace(/^\//, "")] = Number(last);
-//   // Optional (can be throttled): recompute to move the ATM band if price crossed a strike
-//   // safeBroadcast({ topic: "watchlist", data: makeWatchlistPayload() });
-//   await evaluateStopsOnTick(ul, price);
-// }
-// Ensure this exists somewhere globally
-// const lastBySymbol = typeof lastBySymbol === "object" && lastBySymbol
-//   ? lastBySymbol
-//   : Object.create(null);
-
 async function onTick(symbol, last) {
   // normalize inputs
   const ul = String(symbol || "").toUpperCase().replace(/^\//, "");
@@ -4715,10 +3201,6 @@ async function onTick(symbol, last) {
   // cache latest underlying price
   lastBySymbol[ul] = price;
 
-  // If you broadcast watchlist updates on every tick, consider throttling/debouncing.
-  // safeBroadcast?.({ topic: "watchlist", data: makeWatchlistPayload?.() });
-
-  // Evaluate ATR/trailing stops for any positions keyed to this underlying
   try {
     const maybePromise = evaluateStopsOnTick?.(ul, price);
     // support both sync and async implementations
@@ -4738,30 +3220,19 @@ function safeBroadcast(msg) {
   } catch {}
 }
 
-/* Optional: read-only demo options endpoint */
-// app.get("/watchlist/options", (_req, res) => {
-//   res.json({ options: STATE.watchlist.options || [] });
-// });
 function makeWatchlistPayload() {
   const wf = loadWatchlistFile();
   const options = wf.equities.flatMap((ul) => buildOptionsAroundATM(ul, getLast));
   return { equities: wf.equities, options };
 }
 
-/* ---------- REST: single source of truth + generated options ---------- */
+
 app.get("/watchlist", (_req, res) => {
   res.json(makeWatchlistPayload());
 });
 
 
-// function normalizePrint(p) {
-//   return {
-//     ...p,
-//     size: Math.max(1, Math.floor(p.size || (1 + Math.random()*30))), // 1..30
-//     venue: p.venue || (Math.random() < 0.5 ? "cboe" : "nyse-arcx"),
-//     ts: p.ts || Date.now()
-//   };
-// }
+
 const MAX_BUFFER_MS = 5 * 60_000; // keep 5 min
 function pruneBuffer() {
   const cutoff = Date.now() - MAX_BUFFER_MS;
@@ -4900,67 +3371,21 @@ app.post("/tape/filters", (req,res)=>{
   TAPE_FILTERS = { ...TAPE_FILTERS, ...(req.body||{}) };
   res.json({ ok:true, filters: TAPE_FILTERS });
 });
-// async function pollSweepsOnce(){ 
-//   try {
-//     pruneBuffer();
-//     const trades = (STATE.options_ts||[]).map(normalizePrint);
-//     const sweeps = buildSweepsFromTrades(trades, TAPE_CFG);
-//     const next = filterTape(sweeps);
-//     const changed = JSON.stringify(next)!==JSON.stringify(STATE.sweeps||[]);
-//     STATE.sweeps = next;
-//     if (changed) wsBroadcast("sweeps", next);
-//   } catch(e){ console.warn("pollSweepsOnce:", e.message); }
-// }
-
-// async function pollBlocksOnce(){ 
-//   try {
-//     pruneBuffer();
-//     const trades = (STATE.options_ts||[]).map(normalizePrint);
-//     const blocks = buildBlocksFromTrades(trades, TAPE_CFG);
-//     const next = filterTape(blocks);
-//     const changed = JSON.stringify(next)!==JSON.stringify(STATE.blocks||[]);
-//     STATE.blocks = next;
-//     if (changed) wsBroadcast("blocks", next);
-//   } catch(e){ console.warn("pollBlocksOnce:", e.message); }
-// }
-
-// /* === (Optional) demo sweep/block fillers so your UI lists show content === */
-// function demoTapeFromOptions(optionsTicks, kind){
-//   // produce large-looking prints like your screenshots
-//   const out=[];
-//   for (const t of optionsTicks.slice(0, 12)){
-//     const notional = (Math.abs(t.last||0) * 100 * 10) || (Math.random()*250000+80000);
-//     out.push({
-//       kind: kind.toUpperCase(),                 // "SWEEP" | "BLOCK"
-//       ul: t.underlying,
-//       right: t.right==="C" ? "CALL" : "PUT",
-//       strike: t.strike,
-//       expiry: t.expiration,
-//       side: "BUY",
-//       qty: 10,
-//       price: Math.max(0.01, Number((t.last||1).toFixed(2))),
-//       notional: Number(notional.toFixed(2)),
-//       prints: Math.floor(1+Math.random()*3),
-//       venue: "tradier",
-//       ts: Date.now()
-//     });
-//   }
-//   return out;
-// }
 app.get("/tape", (_req,res)=>{
   res.json({ sweeps: STATE.sweeps||[], blocks: STATE.blocks||[] });
 });
 
-// async function pollSweepsOnce(){ try {
-//   const next = demoTapeFromOptions(STATE.options_ts||[], "SWEEP");
-//   const changed = JSON.stringify(next)!==JSON.stringify(STATE.sweeps||[]);
-//   STATE.sweeps = next; if (changed) wsBroadcast("sweeps", next);
-// } catch(e){ console.warn("pollSweepsOnce:", e.message); } }
-// async function pollBlocksOnce(){ try {
-//   const next = demoTapeFromOptions(STATE.options_ts||[], "BLOCK");
-//   const changed = JSON.stringify(next)!==JSON.stringify(STATE.blocks||[]);
-//   STATE.blocks = next; if (changed) wsBroadcast("blocks", next);
-// } catch(e){ console.warn("pollBlocksOnce:", e.message); } }
+// wss.onmessage = (ev) => {
+//   try { console.log("WS:", JSON.parse(ev.data)); } catch { console.log(ev.data); }
+// };
+wsBroadcast("watchlist", getWatchlist()); // or WATCHLIST, or broadcastWatchlist()
+
+// seed WATCH from your local EQUITIES and options list:
+for (const s of EQUITIES) await addEquity(s);            // populates WATCH.equities
+await addOptions(WATCHLIST.options);                      // populates WATCH.options
+
+// (optionally) immediately broadcast the watchlist:
+broadcastWatchlist();
 
 /* ================= WS bootstrap ================= */
 wss.on("connection", (ws) => {
@@ -4968,8 +3393,9 @@ wss.on("connection", (ws) => {
   wsSend(ws, "options_ts", STATE.options_ts || []);
   wsSend(ws, "sweeps",    STATE.sweeps    || []);
   wsSend(ws, "blocks",    STATE.blocks    || []);
+  wsBroadcast("watchlist", makeWatchlistPayload());
   // wsSend(ws, "watchlist", getWatchlist()); // <-- shared
-  wsSend(ws, "watchlist", makeWatchlistPayload());
+  // wsSend(ws, "watchlist", makeWatchlistPayload());
   wsSend(ws, "headlines", computeHeadlines());   // <— add this
 
   // NEW: seed "notables" immediately so the widget doesn’t wait 2s tick
@@ -4977,7 +3403,7 @@ wss.on("connection", (ws) => {
   wsSend(ws, "notables", bootNotables);  
 });
 (async () => {
-  try { await seedWatchlist(); } catch (e) { console.warn("seedWatchlist:", e.message); }
+  // try { await seedWatchlist(); } catch (e) { console.warn("seedWatchlist:", e.message); }
 })();
 // small helper so both REST + WS use the same builder
 function computeNotables(cfg = NOTABLES_DEFAULT) {
@@ -5029,37 +3455,10 @@ setTimeout(() => runLoop("sweeps",   pollSweepsOnce,   { intervalMs: 5_000  }), 
 setTimeout(() => runLoop("blocks",   pollBlocksOnce,   { intervalMs: 5_000  }), 750);
 setTimeout(() => runLoop("prune",    pruneTapeAges,    { intervalMs: 2_000  }), 1000);
 
-// Notables: compute → broadcast only on JSON diff (already debounced by compare)
-// let lastNotablesJson = "";
-// runLoop("notables", async () => {
-//   const notables = computeNotables(NOTABLES_DEFAULT);
-//   const s = JSON.stringify(notables);
-//   if (s !== lastNotablesJson) {
-//     const arr = notables || [];
-//     wsBroadcast("notables", arr);
-//     lastNotablesJson = s;
-//   }
-// }, { intervalMs: 2_000 });
-
 runLoop("notables", async () => {
   const notables = computeNotables(NOTABLES_DEFAULT);
   safeBroadcastNotables(notables || []);
 }, { intervalMs: 2_000 });
-
-// /* ================= SCHEDULERS ================= */
-// setInterval(pollEquitiesOnce, 10_000);
-// setInterval(pollOptionsOnce,  13_000);
-// setInterval(pollSweepsOnce,    5_000);
-// setInterval(pollBlocksOnce,    5_000);
-// setInterval(pruneTapeAges, 2_000);
-// setInterval(() => {
-//   const notables = computeNotables(NOTABLES_DEFAULT);
-//   const s = JSON.stringify(notables);
-//   if (s !== lastNotablesJson) {
-//     wsBroadcast("notables", notables);
-//     lastNotablesJson = s;
-//   }
-// }, 2000); // lightweight, debounced by JSON compare
 
 function computeHeadlines({ windowMs = ROLLING_MS, minNotional = 50_000, topN = 12 } = {}) {
   const now = Date.now();
@@ -5103,19 +3502,16 @@ function computeHeadlines({ windowMs = ROLLING_MS, minNotional = 50_000, topN = 
   items.sort((a, b) => (b.notional || 0) - (a.notional || 0));
   return items.slice(0, topN);
 }
+setInterval(() => {
+  const fopCount = Array.from(NBBO_OPT.keys()).filter(k => /^ES\s\d{6}\sFOP/.test(k)).length;
+  console.log(`[FOP] tracked NBBO keys: ${fopCount}, prints buffer: ${STATE.prints?.length||0}`);
+}, 5000);
 // WS broadcast every 2s
 setInterval(() => {
   const headlines = computeHeadlines({ windowMs: ROLLING_MS, minNotional: 50_000, topN: 12 });
   wsBroadcast("headlines", headlines);
 }, 2_000);
 
-// setInterval(() => {
-//   const payload = buildNotables({ sweeps: STATE.sweeps||[], blocks: STATE.blocks||[], prints: STATE.prints||[] }, NOTABLES_DEFAULT)//buildNotables({ sweeps: STATE.sweeps||[], blocks: STATE.blocks||[] }, NOTABLES_DEFAULT);
-  
-//   const s = JSON.stringify(payload);
-//   const arr = payload || [];
-//   if (s !== lastNotablesJson) { wsBroadcast("notables", arr); lastNotablesJson = s; }
-// }, 1500);
 setInterval(() => {
   const payload = buildNotables(
     { sweeps: STATE.sweeps||[], blocks: STATE.blocks||[], prints: STATE.prints||[] },
@@ -5125,25 +3521,34 @@ setInterval(() => {
 }, 1500);
 
 // REST endpoint (optional)
-app.get("/api/flow/headlines", (_req, res) => {
-  const top = computeHeadlines({ windowMs: ROLLING_MS, minNotional: 50_000, topN: 20 });
-  res.json(top);
+// app.get("/api/flow/headlines", (_req, res) => {
+//   const top = computeHeadlines({ windowMs: ROLLING_MS, minNotional: 50_000, topN: 20 });
+//   res.json(top);
+// });
+app.get('/api/flow/headlines', (req, res) => {
+  const ul = normalizeSymbol(req.query.ul ?? "");
+  const since = Number(req.query.since ?? 0);
+  const rows = store.headlines.filter(h =>
+    (!ul || h.ul === ul) && (!since || h.ts >= since)
+  );
+  res.json(rows);
 });
-
+function assertCanonicalRows(topic, rows, key='symbol') {
+  for (const r of rows) {
+    const n = normalizeSymbol(r[key]);
+    if (n !== r[key]) {
+      console.warn(`[canon:${topic}] ${r[key]} -> ${n}`);
+    }
+  }
+}
+// --- PRICES FEED (where you build equity_ts) ---
+function pumpEquityTs(ticks) {
+  // normalize all symbols before emit
+  const data = ticks.map(t => ({ ...t, symbol: normalizeSymbol(t.symbol) }));
+  broadcast('equity_ts', data);
+}
 /* ================= ROUTES ================= */
 app.get("/", (req,res)=>res.type("text/plain").send("TradeFlash server up\n"));
-
-app.post("/watch/alpaca", async (req, res) => {
-  const equities = Array.isArray(req.body?.equities) ? req.body.equities : [];
-  const added = await watchAddEquities(equities);
-  res.json({ ok:true, watching:getWatchlist(), added });
-});
-app.post("/watch/tradier", async (req, res) => {
-  const options = Array.isArray(req.body?.options) ? req.body.options : [];
-  const added = await watchAddOptions(options);
-  res.json({ ok:true, watching:getWatchlist(), added });
-});
-// app.get("/watchlist", (req,res)=>res.json(getWatchlist()));
 
 app.get("/api/flow/chains", async (req,res)=>{
   try{
@@ -5203,79 +3608,34 @@ app.get("/debug/expirations", async (req,res)=>{
     res.json({ symbol, conid, expirations });
   } catch (e) { res.status(500).json({ error: e.message||"expirations failed" }); }
 });
-app.get("/health", (req,res)=>{
-  res.json({ ok:true, primed:CACHE.sessionPrimed, watch:getWatchlist(),
-    eq_len: STATE.equities_ts?.length||0, opt_len: STATE.options_ts?.length||0 });
+// app.get("/health", (req,res)=>{
+//   res.json({ ok:true, primed:CACHE.sessionPrimed, watch:getWatchlist(),
+//     eq_len: STATE.equities_ts?.length||0, opt_len: STATE.options_ts?.length||0 });
+// });
+
+const store = { prints: [], headlines: [] };
+const { broadcast, metrics } = makeBus(wss);
+app.get('/api/flow/debug/dump', (_req, res) => {
+  res.json({
+    prints: store.prints?.slice(-50) ?? [],
+    headlines: store.headlines?.slice(-50) ?? []
+  });
+});
+// Health + metrics (quick peek if futures are flowing)
+app.get("/healthz", (_req, res) => {
+  res.json({
+    ok: true,
+    ws_clients: wss.clients.size,
+    metrics
+  });
 });
 
-async function seedDefaultsOnce() {
-  try {
-//     if (fs.existsSync(SEED_MARK)) return;
-//     const curEq = new Set(normEquities(WATCH));
-//     const toAddEq = DEFAULT_EQUITIES.filter(s => !curEq.has(s));
-//     if (toAddEq.length) await watchAddEquities(toAddEq);
+app.use("/api/flow/prints", makePrintsRouter({ store, broadcast }));
+app.use("/api/flow/headlines", makeHeadlinesRouter({ store, broadcast }));
 
-//     const curOptsKey = new Set(normOptions(WATCH).map(o => `${o.underlying}:${o.expiration}:${o.strike}:${o.right}`));
-//     const toAddOpts = DEFAULT_OPTIONS.filter(o => {
-//       const k = `${String(o.underlying).toUpperCase()}:${o.expiration}:${o.strike}:${String(o.right).toUpperCase()[0]}`;
-//       return !curOptsKey.has(k);
-//     });
-//     if (toAddOpts.length) await watchAddOptions(toAddOpts);
-
-//     // kick first polls so UI has data immediately
-//     await pollEquitiesOnce();
-//     await pollOptionsOnce();
-//     wsBroadcast("watchlist", getWatchlist());
-//     if (STATE.equities_ts?.length) wsBroadcast("equity_ts", STATE.equities_ts);
-//     if (STATE.options_ts?.length)  wsBroadcast("options_ts", STATE.options_ts);
-
-//     fs.writeFileSync(SEED_MARK, new Date().toISOString());
-//     console.log(`[seed] equities=${JSON.stringify(toAddEq)} options=${toAddOpts.length}`);
-//   } catch (e) { console.warn("seedDefaultsOnce:", e.message); }
-// }
-    // Only seed once when either DEMO is on, or explicit SEED_ON_EMPTY is set AND the watchlist is empty.
-    const isEmpty = (WATCH.equities?.size || 0) === 0 && (WATCH.options?.length || 0) === 0;
-    if (fs.existsSync(SEED_MARK)) return;
-    if (!(DEMO || (SEED_ON_EMPTY && isEmpty))) return;
-
-    const curEq = new Set(normEquities(WATCH));
-    const envList = (process.env.DEFAULT_EQUITIES || "").trim();
-    const desiredEq = (envList ? envList.split(",") : POPULAR_50)
-      .map(s => s.trim().toUpperCase())
-      .filter(Boolean);
-    const toAddEq = desiredEq.filter(s => !curEq.has(s));
-    if (toAddEq.length) await watchAddEquities(toAddEq);
-
-    // Only add default options in DEMO
-    let toAddOpts = [];
-    if (DEMO) {
-      const curOptsKey = new Set(
-        normOptions(WATCH).map(o => `${o.underlying}:${o.expiration}:${o.strike}:${o.right}`)
-      );
-      toAddOpts = DEFAULT_OPTIONS.filter(o => {
-        const k = `${String(o.underlying).toUpperCase()}:${o.expiration}:${o.strike}:${String(o.right).toUpperCase()[0]}`;
-        return !curOptsKey.has(k);
-      });
-      if (toAddOpts.length) await watchAddOptions(toAddOpts);
-    }
-
-    // Kick first polls ONLY if we actually added something
-    if (toAddEq.length) await pollEquitiesOnce();
-    if (toAddOpts.length) await pollOptionsOnce();
-
-    // wsBroadcast("watchlist", getWatchlist());
-    wsBroadcast("watchlist", makeWatchlistPayload());
-    if (Array.isArray(STATE.equities_ts) && STATE.equities_ts.length) wsBroadcast("equity_ts", STATE.equities_ts);
-    if (Array.isArray(STATE.options_ts)  && STATE.options_ts.length)  wsBroadcast("options_ts",  STATE.options_ts);
-
-    fs.writeFileSync(SEED_MARK, new Date().toISOString());
-    console.log(`[seed] mode=${DEMO ? "DEMO" : "SEED_ON_EMPTY"} equities=${toAddEq.length} options=${toAddOpts.length}`);
-   } catch (e) { console.warn("seedDefaultsOnce:", e.message); }
- }
- 
 server.listen(PORT, async () => {
   console.log(`Listening on http://localhost:${PORT}`);
-  await seedDefaultsOnce();
+  // await seedDefaultsOnce();
 });
 
 /* ============ QUICK CURLS =============

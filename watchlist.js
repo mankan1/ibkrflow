@@ -37,25 +37,34 @@ export function saveWatchlistFile(wf) {
   fs.writeFileSync(FILE, JSON.stringify({ equities: wf.equities }, null, 2));
 }
 
-export function buildOptionsAroundATM(sym, getLast, around = STRIKES_AROUND_ATM) {
-  const s = norm(sym);
-  const last = getLast(s);
-  if (!Number.isFinite(last)) return [];
-
-  const step = stepFor(s);
-  const atm  = roundToStep(last, step);
-
-  const expiries = pickNearExpirations(); // simple: next 2 Fridays
-  const out = [];
-  for (const expiration of expiries) {
-    for (let i = -around; i <= around; i++) {
-      const strike = +(atm + i * step).toFixed(2);
-      out.push({ underlying: s, expiration, strike, right: "C" });
-      out.push({ underlying: s, expiration, strike, right: "P" });
-    }
-  }
-  return out;
+// ---------- symbol helpers ----------
+function isFutureSymbol(sym) {
+  if (!sym) return false;
+  const s = String(sym).toUpperCase();
+  if (s.startsWith("/")) return true; // e.g. /ES, /NQ
+  const FUTS = new Set(["ES","NQ","RTY","YM","CL","GC","SI","ZN","ZB","ZF","ZT","HG","NG"]);
+  return FUTS.has(s);
 }
+
+// export function buildOptionsAroundATM(sym, getLast, around = STRIKES_AROUND_ATM) {
+//   const s = norm(sym);
+//   const last = getLast(s);
+//   if (!Number.isFinite(last)) return [];
+
+//   const step = stepFor(s);
+//   const atm  = roundToStep(last, step);
+
+//   const expiries = pickNearExpirations(); // simple: next 2 Fridays
+//   const out = [];
+//   for (const expiration of expiries) {
+//     for (let i = -around; i <= around; i++) {
+//       const strike = +(atm + i * step).toFixed(2);
+//       out.push({ underlying: s, expiration, strike, right: "C" });
+//       out.push({ underlying: s, expiration, strike, right: "P" });
+//     }
+//   }
+//   return out;
+// }
 
 function pickNearExpirations() {
   const out = [];
