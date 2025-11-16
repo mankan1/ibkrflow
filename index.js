@@ -170,6 +170,212 @@ let wss = /** @type {import('ws').WebSocketServer|null} */ (null);
 wss = new WebSocketServer({ server, perMessageDeflate: false });
 wsReady = true;
 
+/* ================= LOGGING INSTRUMENTATION (no logic changes) =================
+ * ENV:
+ *   LOG_LEVEL=info|debug (default: info)
+ *   LOG_JSON=1          (emit JSON lines)
+ *   LOG_SAMPLE_WS=0.05  (sample 5% of WS payloads; default 0 = off)
+ *   LOG_SAMPLE_FLOW=0.25 (sample 25% of prints/sweeps/blocks; default 0 = off)
+ *   LOG_TIMINGS=1       (include ms timings for wrapped calls)
+ * -----------------------------------------------------------------------------*/
+
+const LOG = {
+  level: (process.env.LOG_LEVEL || "info").toLowerCase(),
+  json:  process.env.LOG_JSON === "1",
+  wsRate: Number(process.env.LOG_SAMPLE_WS || 0),
+  flowRate: Number(process.env.LOG_SAMPLE_FLOW || 0),
+  timings: process.env.LOG_TIMINGS === "1",
+};
+const LV = { error:0, warn:1, info:2, debug:3 };
+const can = (lvl)=> (LV[LOG.level] ?? 2) >= (LV[lvl] ?? 2);
+const now = ()=> Date.now();
+
+function jl(lvl, msg, meta){
+  if (!can(lvl)) return;
+  if (LOG.json){
+    const row = { t:new Date().toISOString(), lvl, msg, ...(meta||{}) };
+    // Keep payloads small on purpose
+    if (row.payload && typeof row.payload === "string" && row.payload.length > 512) {
+      row.payload = row.payload.slice(0, 512) + "…";
+    }
+    console.log(JSON.stringify(row));
+  }else{
+    const prefix = `[${lvl.toUpperCase()}]`;
+    if (meta) console.log(prefix, msg, meta); else console.log(prefix, msg);
+  }
+}
+
+/* ================= Tiny counters to peek at health ================= */
+const METRICS = {
+  ws_sends: 0,
+  ws_dropped_not_ready: 0,
+  ib_fetch_ok: 0,
+  ib_fetch_err: 0,
+  ib_429: 0,
+  equities_ticks: 0,
+  option_nbbo_updates: 0,
+  prints_seen: 0,
+  sweeps_published: 0,
+  blocks_published: 0,
+  autotrade_open: 0,
+  autotrade_close: 0,
+  last_equities_poll_ms: 0,
+  last_options_poll_ms: 0,
+};
+app.get("/debug/metrics", (_req, res) => res.json({ ...METRICS, ts: Date.now() }));
+
+/* ========== Wrap wsBroadcast (counts + sampled payload) ========== */
+const _wsBroadcast_orig = wsBroadcast;
+wsBroadcast = function wsBroadcast_logged(topic, data){
+  const start = LOG.timings ? now() : 0;
+  try {
+    METRICS.ws_sends++;
+    if (!wsReady || !wss) METRICS.ws_dropped_not_ready++;
+    if (LOG.wsRate > 0 && Math.random() < LOG.wsRate) {
+      jl("debug", "wsBroadcast", { topic, sample: true, size: (JSON.stringify(data)||"").length });
+    } else if (can("info") && (topic === "equity_ts" || topic === "basis")) {
+      jl("debug", "wsBroadcast", { topic }); // lightweight for hot topics
+    }
+    return _wsBroadcast_orig(topic, data);
+  } finally {
+    if (LOG.timings) jl("debug", "wsBroadcast.timing", { topic, ms: now() - start });
+  }
+};
+
+/* ========== Wrap ibFetch (status codes + latencies + 429s) ========== */
+const _ibFetch_orig = ibFetch;
+ibFetch = async function ibFetch_logged(path, opts = {}, _retry = false){
+  const start = LOG.timings ? now() : 0;
+  try {
+    const out = await _ibFetch_orig(path, opts, _retry);
+    METRICS.ib_fetch_ok++;
+    if (can("debug")) jl("debug", "ibFetch.ok", { path });
+    return out;
+  } catch (e) {
+    METRICS.ib_fetch_err++;
+    const msg = String(e?.message || e);
+    if (msg.includes("IB 429")) METRICS.ib_429++;
+    jl("warn", "ibFetch.err", { path, err: msg });
+    throw e;
+  } finally {
+    if (LOG.timings) jl("debug", "ibFetch.timing", { path, ms: now() - start });
+  }
+};
+
+/* ========== Light wrappers for hot paths (no behavior changes) ========== */
+const _ingestOptionQuote = ingestOptionQuote;
+ingestOptionQuote = function ingestOptionQuote_logged(row){
+  METRICS.option_nbbo_updates++;
+  if (can("debug")) jl("debug", "nbbo.update", { occ: row?.occ, bid: row?.bid, ask: row?.ask });
+  return _ingestOptionQuote(row);
+};
+
+const _pushAndFanout = pushAndFanout;
+pushAndFanout = function pushAndFanout_logged(msg){
+  // Sample only to keep logs useful
+  const type = String(msg?.type || "").toLowerCase();
+  if (type === "print") METRICS.prints_seen++;
+  if ((type === "sweeps" || type === "blocks")) {
+    const shouldLog = LOG.flowRate > 0 ? Math.random() < LOG.flowRate : false;
+    if (shouldLog) {
+      const { ul, right, strike, expiry, side, qty, price, notional, action, at } = msg || {};
+      jl("info", `flow.${type}`, { ul, right, strike, expiry, side, qty, price, notional, action, at });
+    }
+  }
+  return _pushAndFanout(msg);
+};
+
+const _publishSweeps = publishSweeps;
+publishSweeps = function publishSweeps_logged(rows){
+  METRICS.sweeps_published += Array.isArray(rows) ? rows.length : 1;
+  if (can("debug")) jl("debug", "publish.sweeps", { count: Array.isArray(rows) ? rows.length : 1 });
+  return _publishSweeps(rows);
+};
+
+const _publishBlocks = publishBlocks;
+publishBlocks = function publishBlocks_logged(rows){
+  METRICS.blocks_published += Array.isArray(rows) ? rows.length : 1;
+  if (can("debug")) jl("debug", "publish.blocks", { count: Array.isArray(rows) ? rows.length : 1 });
+  return _publishBlocks(rows);
+};
+
+/* ========== Pollers: log begin/end + duration ========== */
+const _pollEquitiesOnce = pollEquitiesOnce;
+pollEquitiesOnce = async function pollEquitiesOnce_logged(){
+  const t0 = LOG.timings ? now() : 0;
+  jl("debug", "poll.equities.begin");
+  try {
+    const out = await _pollEquitiesOnce();
+    const ms = LOG.timings ? now() - t0 : 0;
+    METRICS.last_equities_poll_ms = ms;
+    jl("info", "poll.equities.end", { ms, rows: Array.isArray(STATE.equities_ts) ? STATE.equities_ts.length : 0 });
+    return out;
+  } catch (e) {
+    jl("warn", "poll.equities.err", { err: String(e?.message || e) });
+    throw e;
+  }
+};
+
+const _pollOptionsOnce = pollOptionsOnce;
+pollOptionsOnce = async function pollOptionsOnce_logged(){
+  const t0 = LOG.timings ? now() : 0;
+  jl("debug", "poll.options.begin");
+  try {
+    const out = await _pollOptionsOnce();
+    const ms = LOG.timings ? now() - t0 : 0;
+    METRICS.last_options_poll_ms = ms;
+    jl("info", "poll.options.end", { ms });
+    return out;
+  } catch (e) {
+    jl("warn", "poll.options.err", { err: String(e?.message || e) });
+    throw e;
+  }
+};
+
+/* ========== Autotrade entry/exit breadcrumbs ========== */
+const _autoTradeOnFlow = autoTradeOnFlow;
+autoTradeOnFlow = async function autoTradeOnFlow_logged(msg, underPx){
+  try {
+    const { ul, right, strike, expiry, action, price, qty } = msg || {};
+    jl("debug", "autotrade.consider", { ul, right, strike, expiry, action, price, qty, underPx });
+    const before = OPEN_COUNT;
+    const out = await _autoTradeOnFlow(msg, underPx);
+    if (OPEN_COUNT > before) { METRICS.autotrade_open++; jl("info", "autotrade.opened", { ul, right, strike, expiry, qty }); }
+    return out;
+  } catch (e) {
+    jl("warn", "autotrade.err", { err: String(e?.message || e) });
+    throw e;
+  }
+};
+
+const _evaluateStopsOnTick = evaluateStopsOnTick;
+evaluateStopsOnTick = async function evaluateStopsOnTick_logged(ul, px){
+  const prev = OPEN_COUNT;
+  const out = await _evaluateStopsOnTick(ul, px);
+  if (OPEN_COUNT < prev) { METRICS.autotrade_close += (prev - OPEN_COUNT); jl("info", "autotrade.closed", { ul, px }); }
+  return out;
+};
+
+/* ========== Quote ticks count (called inside pollEquitiesOnce) ========== */
+const _onTick = typeof onTick === "function" ? onTick : null;
+if (_onTick) {
+  global.onTick = async function onTick_logged(sym, px){
+    METRICS.equities_ticks++;
+    if (can("debug")) jl("debug", "tick", { sym, px });
+    return _onTick(sym, px);
+  };
+}
+
+/* ========== Minimal request logging (morgan already enabled) ========== */
+app.use((req, _res, next) => {
+  if (!can("debug")) return next();
+  jl("debug", "http.req", { m: req.method, u: req.originalUrl || req.url });
+  next();
+});
+
+/* ================= END LOGGING INSTRUMENTATION ================= */
+
+
 // ===== Sweep/Block thresholds =====
 const MIN_SWEEP_QTY       = Number(process.env.MIN_SWEEP_QTY || 50);     // contracts
 const MIN_SWEEP_NOTIONAL  = Number(process.env.MIN_SWEEP_NOTIONAL || 20000); // $ (qty * price * 100)
@@ -197,6 +403,48 @@ const AUTOTRADE = {
   orderType: "MKT",            // "MKT" or "LMT" (LMT uses mid)
   maxOpenPositions: 10,        // safety limit
 };
+
+const fopCache = new Map(); // key: ES|20251112|C|6800 -> conid
+
+export async function ensureFopConid(item) {
+  const root  = normalizeRoot(item.underlying); // "/ES" -> "ES"
+  const right = item.right;
+  const strike = Number(item.strike);
+  const ymd = item.expiration.replaceAll("-", ""); // "2025-11-12" -> "20251112"
+  const key = `${root}|${ymd}|${right}|${strike}`;
+  if (fopCache.has(key)) return fopCache.get(key);
+
+  const conid = await searchFopContracts(root, { right, strike, ymd });
+  if (conid) fopCache.set(key, conid);
+  return conid;
+}
+
+export async function pollFopOnce(items) {
+  const results = [];
+  const want = items.length;
+  let normalized = 0, resolved = 0, snapped = 0;
+
+  for (const it of items) {
+    const conid = await ensureFopConid(it);
+    if (!conid) continue;
+    const snap = await fopSnapshot(conid);
+    if (!snap) continue;
+    if (conid) resolved++;
+    const snap1 = conid ? await fopSnapshot(conid) : null;
+    if (snap1) snapped++;    
+    results.push({
+      occ: `${normalizeRoot(it.underlying)}|${it.expiration}|${it.right}|${it.strike}`,
+      bid: num(snap["84"]), ask: num(snap["85"]),
+      mid: mid(num(snap["84"]), num(snap["85"])),
+      last: num(snap["31"]), ts: Date.now()
+    });
+  }
+  d(`[FOP] want=${want} normalized=${normalized} resolved=${resolved} snapped=${snapped}`);
+  return results;
+}
+
+function num(x){ const n=Number(x); return Number.isFinite(n)?n:null; }
+function mid(b,a){ return (b!=null && a!=null) ? (b+a)/2 : null; }
 
 async function getATRForUnderlying(ul, len = AUTOTRADE.atrLen) {
   if (isFutures(ul)) return getATRForFutures(futRoot(ul), len);
@@ -680,14 +928,23 @@ if (!STATE.watchlist) STATE.watchlist = { equities: [], options: [] };
 // 1) Single source of truth
 // const EQUITIES = ["SPY", "AAPL", "NVDA", "SPX", "/ES", "/NQ", "/YM"]; // what you want in equity_ts
 // const OPTIONABLE = new Set(["SPY", "AAPL", "NVDA", "SPX", "/ES", "/NQ", "/YM"]); // your provider supports
-const EQUITIES = ["/ES", "/NQ"]; // what you want in equity_ts
-const OPTIONABLE = new Set(["/ES", "/NQ"]); // your provider supports
+const EQUITIES = ["/ES", "SPY"]; // what you want in equity_ts
+const OPTIONABLE = new Set(["/ES", "SPY"]); // your provider supports
 
 const OPTION_UNDERLYINGS = EQUITIES.filter(s => OPTIONABLE.has(s)); // derive
 
 // ---------- date helpers ----------
 const toISO = d => new Date(d.getTime() - d.getTimezoneOffset()*60000).toISOString().slice(0, 10);
 const addDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); return x; };
+// fop-subscribe.js (or wherever you subscribe options)
+function subscribeFop(conIdOrContract, genericTicks) {
+  const id = nextTickerId();
+  const c = normalizeToContract(conIdOrContract); // ensure secType/exchange loaded
+  console.log('[FOP] subscribe', { id, secType: c.secType, conId: c.conId, sym: c.symbol, exch: c.exchange, ltd: c.lastTradeDateOrContractMonth, right: c.right, strike: c.strike, tradingClass: c.tradingClass, genericTicks });
+  ib.reqMktData(id, c, genericTicks, false, false, null);
+  tickerIdToContract.set(id, c);
+  return id;
+}
 
 function nextWeekdayOnOrAfter(startDate, weekdays) {
   const want = new Set(weekdays);
@@ -946,7 +1203,7 @@ function occFromParts(ul, expiry, right, strike) {
   return `${root}${yymmdd}${cp}${k}`;
 }
 
-function num(v) { const n = Number(v); return Number.isFinite(n) ? n : undefined; }
+// function num(v) { const n = Number(v); return Number.isFinite(n) ? n : undefined; }
 function normUL(x) { return String(x || "").trim().toUpperCase(); }
 function toOptKey({ occWire, ul, expiry, right, strike }) {
   try {
@@ -1095,6 +1352,7 @@ async function startIBLoops() {
 
   // Pollers
   setInterval(() => { pollEquitiesOnce().catch(()=>{}); }, 1_500);  // ~0.7 Hz
+  setInterval(() => { pollFopOnce().catch(()=>{}); }, 1_500);  // ~0.7 Hz
   setInterval(() => { pollOptionsOnce().catch(()=>{});  }, 1_500);  // ~0.4 Hz
 
   // Your existing synthesizer timers are already running (every 1s / 5s)
@@ -2716,6 +2974,201 @@ function optKey(ul, expiration, right /* "C"|"P" or "CALL"/"PUT" */, strike) {
   }
   return toOcc(u, expiration, cp, strike);
 }
+// Track what the user asked us to subscribe to (for GET /api/options/subscriptions)
+const TRACKED_OPTIONS = new Map(); // key -> { ul, expiry, right, strike, conid, addedTs }
+
+// Resolve conid for either equity OPT or futures FOP using your existing helpers
+async function resolveAnyOptionConid(ul, expiryISO, rightCP, strike) {
+  const isFut = isFutureSymbol(ul) || FUTS_ALIASES.has(String(ul).toUpperCase());
+  if (isFut) {
+    // Normalize root like "/ES" -> "ES"
+    const root = futRoot(ul);
+    return resolveFopConid(root, expiryISO, rightCP, strike);
+  }
+  return ibConidForOption(ul, expiryISO, rightCP, strike);
+}
+
+// Seed NBBO_OPT and the cache so refreshOptionNBBOFast() keeps them warm
+async function seedOptionQuoteSnapshot(optConid, key) {
+  try {
+    // 84=bid, 86=ask
+    const snaps = await ibFetch(`/iserver/marketdata/snapshot?conids=${encodeURIComponent(String(optConid))}&fields=84,86`);
+    const r = Array.isArray(snaps) ? snaps[0] : null;
+    const bid = Number(r?.["84"]);
+    const ask = Number(r?.["86"]);
+    if (Number.isFinite(bid) || Number.isFinite(ask)) {
+      NBBO_OPT.set(key, { bid: bid || 0, ask: ask || 0, ts: Date.now() });
+      ingestOptionQuote({
+        occ: key,
+        bid: Number.isFinite(bid) ? bid : undefined,
+        ask: Number.isFinite(ask) ? ask : undefined,
+        mid: (Number.isFinite(bid) && Number.isFinite(ask) && bid>0 && ask>0) ? (bid+ask)/2 : undefined,
+        ts: Date.now()
+      });
+    }
+  } catch (_) {}
+}
+
+// ===== routes to satisfy your script =====
+
+// (best-effort) set market data type; IB Web API doesn’t really need this, so no-op OK
+app.post("/api/debug/market-data-type", (req, res) => {
+  const type = Number(req.body?.type ?? 1);
+  res.json({ ok: true, type });
+});
+app.post("/api/debug/market_data_type", (req, res) => {
+  const type = Number(req.body?.type ?? 1);
+  res.json({ ok: true, type });
+});
+app.post("/api/debug/set-market-data-type", (req, res) => {
+  const type = Number(req.body?.type ?? 1);
+  res.json({ ok: true, type });
+});
+app.post("/api/debug/set_market_data_type", (req, res) => {
+  const type = Number(req.body?.type ?? 1);
+  res.json({ ok: true, type });
+});
+
+// Subscribe one option (equity or futures) — body: { root|underlying, expiry:"YYYYMMDD|YYYY-MM-DD", right:"C|P", strike:number }
+// app.post("/api/options/subscribe", async (req, res) => {
+//   try {
+//     const ulIn   = (req.body.root ?? req.body.underlying ?? req.body.ul ?? "").toString();
+//     const expiry = (req.body.expiry ?? req.body.expiration ?? "").toString();
+//     const right  = rightToCP(req.body.right);
+//     const strike = Number(req.body.strike);
+
+//     if (!ulIn || !expiry || (right !== "C" && right !== "P") || !Number.isFinite(strike)) {
+//       return res.status(400).json({ error: "required: {root|underlying}, expiry, right(C|P), strike" });
+//     }
+
+//     // Normalize inputs
+//     const ulNorm = normalizeSymbol(ulIn); // handles "/ES" -> "ES" where appropriate
+//     const expiryISO = /^\d{8}$/.test(expiry)
+//       ? `${expiry.slice(0,4)}-${expiry.slice(4,6)}-${expiry.slice(6,8)}`
+//       : expiry;
+
+//     // Resolve conid and cache it so fast-NBBO will keep refreshing
+//     const conid = await resolveAnyOptionConid(ulNorm, expiryISO, right, strike);
+//     if (!conid) return res.status(404).json({ error: "could not resolve conid" });
+
+//     const key = optKey(ulNorm, expiryISO, right, strike);
+//     cacheOptConid.set(key, { conid: String(conid), ts: Date.now() });
+//     TRACKED_OPTIONS.set(key, { ul: ulNorm, expiry: expiryISO, right, strike, conid: String(conid), addedTs: Date.now() });
+
+//     // Seed a snapshot so quotes appear immediately
+//     await seedOptionQuoteSnapshot(conid, key);
+
+//     // Reply with what we’re tracking
+//     return res.json({ ok: true, key, conid: String(conid) });
+//   } catch (e) {
+//     return res.status(500).json({ error: String(e?.message || e) });
+//   }
+// });
+app.post('/api/options/subscribe', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const ulRaw   = String(body.underlying || '');
+    const rightIn = String(body.right || '').toUpperCase(); // "C"|"P"|"CALL"|"PUT"
+    const strike  = Number(body.strike);
+
+    if (!ulRaw || !rightIn || !Number.isFinite(strike)) {
+      return res.status(400).json({ error: 'underlying, right, strike required' });
+    }
+
+    // 1) Normalize UL and expiry
+    const ul = normalizeSymbol(ulRaw); // handles "/ES" -> "ES"
+    let expiryISO = String(body.expiry || '');
+    if (/^\d{8}$/.test(expiryISO)) {
+      expiryISO = expiryISO.replace(/(\d{4})(\d{2})(\d{2})/, '$1-$2-$3'); // "2025-11-14"
+    }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(expiryISO)) {
+      return res.status(400).json({ error: 'expiry must be YYYY-MM-DD or YYYYMMDD' });
+    }
+
+    // 2) Canonical right
+    const right = (rightIn === 'C' || rightIn === 'CALL') ? 'C'
+                : (rightIn === 'P' || rightIn === 'PUT')  ? 'P' : null;
+    if (!right) return res.status(400).json({ error: 'right must be C|P' });
+
+    // 3) Futures vs equities: ES must go through FOP resolver
+    let optConid = null;
+    if (isFutures(ul)) {
+      // Ensure we know the active future first
+      const active = await resolveFrontMonthES().catch(()=>null);
+      if (!active?.conid) {
+        return res.status(500).json({ error: 'no active ES future conid' });
+      }
+      optConid = await resolveFopConid(ul, expiryISO, right, strike);
+    } else {
+      optConid = await resolveOptConid(ul, expiryISO, right, strike);
+    }
+
+    if (!optConid) {
+      return res.status(404).json({ error: 'could not resolve conid' });
+    }
+
+    // 4) Subscribe using the FOP contract (don’t use tradingClass here)
+    const tid = subscribeFop({ conId: optConid, secType: 'FOP', exchange: 'GLOBEX' }, '83,84,86'); // NBBO etc.
+    return res.json({ ok: true, conid: String(optConid), tickerId: tid });
+  } catch (e) {
+    return res.status(500).json({ error: String(e?.message || e) });
+  }
+});
+// Check active ES future
+app.get('/debug/active_es', (_req,res)=> {
+  const cur = FUT_FRONT.get('ES') || null;
+  res.json(cur || { error: 'no front month cached' });
+});
+// helpers/symbols.js
+export function normalizeRoot(sym) {
+  if (!sym) return sym;
+  const s = sym.trim().toUpperCase();
+  return s.startsWith('/') ? s.slice(1) : s; // "/ES" -> "ES"
+}
+// const root = normalizeRoot(item.underlying); // for FOP watchlist items
+// ib/rest.js (pseudo – adapt to your fetch wrapper)
+export async function searchFopContracts(root, { right, strike, ymd }) {
+  const body = {
+    symbol: root,            // "ES"
+    secType: "FOP",
+    exchange: "GLOBEX",
+    // name/root optional, but helps: name: root
+  };
+  const rows = await post("/iserver/secdef/search", body); // returns array
+  // Narrow down:
+  const want = rows.find(r =>
+    r.secType === "FOP" &&
+    r.tradingClass === "ES" &&
+    String(r.maturityDate) === String(ymd) &&
+    r.right === (right === "C" ? "C" : "P") &&
+    Number(r.strike) === Number(strike)
+  );
+  return want?.conid;
+}
+
+export async function fopSnapshot(conid) {
+  // Fields: last, bid, ask, bidSize, askSize, close, model
+  const fields = "31,84,85,86,87,88,722";
+  const out = await get(`/iserver/marketdata/snapshot?conids=${conid}&fields=${fields}`);
+  return out?.[0];
+}
+// Resolve a single ES FOP conid explicitly
+app.get('/debug/fop_conid', async (req, res) => {
+  const { expiry, right, strike } = req.query;
+  let iso = String(expiry || '');
+  if (/^\d{8}$/.test(iso)) iso = iso.replace(/(\d{4})(\d{2})(\d{2})/,'$1-$2-$3');
+  const conid = await resolveFopConid('ES', iso, String(right||'').toUpperCase(), Number(strike));
+  res.json({ conid: conid ? String(conid) : null });
+});
+
+// List current option subscriptions
+app.get("/api/options/subscriptions", (_req, res) => {
+  res.json({
+    rows: Array.from(TRACKED_OPTIONS.entries()).map(([key, v]) => ({ key, ...v })),
+    ts: Date.now()
+  });
+});
+
 async function ibFopMonthsForRoot(root) {
   // Try secdef search scoped to FUT first
   const fut = await ibFetch(`/iserver/secdef/search?symbol=${encodeURIComponent(root)}&sectype=FUT&exchange=GLOBEX`).catch(()=>null);
